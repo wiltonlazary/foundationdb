@@ -27,9 +27,11 @@
                   "storage",
                   "transaction",
                   "resolution",
-                  "proxy",
+                  "commit_proxy",
+                  "grv_proxy",
                   "master",
-                  "test"
+                  "test",
+                  "storage_cache"
                ]
             },
             "degraded":true,
@@ -59,13 +61,15 @@
                   "role":{
                      "$enum":[
                         "master",
-                        "proxy",
+                        "commit_proxy",
+                        "grv_proxy",
                         "log",
                         "storage",
                         "resolver",
                         "cluster_controller",
                         "data_distributor",
                         "ratekeeper",
+                        "storage_cache",
                         "router",
                         "coordinator"
                      ]
@@ -111,6 +115,44 @@
                      "counter":0,
                      "roughness":0.0
                   },
+                  "grv_latency_statistics":{
+                     "default":{
+                         "count":0,
+                         "min":0.0,
+                         "max":0.0,
+                         "median":0.0,
+                         "mean":0.0,
+                         "p25":0.0,
+                         "p90":0.0,
+                         "p95":0.0,
+                         "p99":0.0,
+                         "p99.9":0.0
+                     }
+                  },
+                  "read_latency_statistics":{
+                     "count":0,
+                     "min":0.0,
+                     "max":0.0,
+                     "median":0.0,
+                     "mean":0.0,
+                     "p25":0.0,
+                     "p90":0.0,
+                     "p95":0.0,
+                     "p99":0.0,
+                     "p99.9":0.0
+                  },
+                  "commit_latency_statistics":{
+                     "count":0,
+                     "min":0.0,
+                     "max":0.0,
+                     "median":0.0,
+                     "mean":0.0,
+                     "p25":0.0,
+                     "p90":0.0,
+                     "p95":0.0,
+                     "p99":0.0,
+                     "p99.9":0.0
+                  },
                   "grv_latency_bands":{ // How many GRV requests belong to the latency (in seconds) band (e.g., How many requests belong to [0.01,0.1] latency band). The key is the upper bound of the band and the lower bound is the next smallest band (or 0, if none). Example: {0.01: 27, 0.1: 18, 1: 1, inf: 98,filtered: 10}, we have 18 requests in [0.01, 0.1) band.
                      "$map_key=upperBoundOfBand": 1
                   },
@@ -119,15 +161,22 @@
                   },
                   "commit_latency_bands":{
                      "$map_key=upperBoundOfBand": 1
+                  },
+                  "busiest_read_tag":{
+                     "tag": "",
+                     "fractional_cost": 0.0,
+                     "estimated_cost":{
+                        "hz":0.0
+                     }
                   }
                }
             ],
             "command_line":"-r simulation",
             "memory":{
-               "available_bytes":0, //an estimate of the process' fair share of the memory available to fdbservers
+               "available_bytes":0, // an estimate of the process' fair share of the memory available to fdbservers
                "limit_bytes":0, // memory limit per process
                "unused_allocated_memory":0,
-               "used_bytes":0
+               "used_bytes":0 // virtual memory size of the process
             },
             "messages":[
                {
@@ -187,6 +236,9 @@
                   "hz":0.0
                },
                "megabits_received":{
+                  "hz":0.0
+               },
+               "tls_policy_failures":{
                   "hz":0.0
                }
             },
@@ -262,10 +314,23 @@
          "transactions_per_second_limit":0,
          "batch_released_transactions_per_second":0,
          "released_transactions_per_second":0,
+         "throttled_tags":{
+            "auto" : {
+                "busy_read" : 0,
+                "busy_write" : 0,
+                "count" : 0
+            },
+            "manual" : {
+                "count" : 0
+            },
+            "recommend" : {
+                "busy_read" : 0,
+                "busy_write" : 0,
+                "count" : 0
+            }
+         },
          "limiting_queue_bytes_storage_server":0,
          "worst_queue_bytes_storage_server":0,
-         "limiting_version_lag_storage_server":0,
-         "worst_version_lag_storage_server":0,
          "limiting_data_lag_storage_server":{
             "versions":0,
             "seconds":0.0
@@ -362,7 +427,9 @@
                   "layer_status_incomplete",
                   "database_availability_timeout",
                   "consistencycheck_suspendkey_fetch_timeout",
-                  "consistencycheck_disabled"
+                  "consistencycheck_disabled",
+                  "primary_dc_missing",
+                  "fetch_primary_dc_timeout"
                ]
             },
             "issues":[
@@ -380,7 +447,8 @@
       ],
       "recovery_state":{
          "required_resolvers":1,
-         "required_proxies":1,
+         "required_commit_proxies":1,
+         "required_grv_proxies":1,
          "name":{ // "fully_recovered" is the healthy state; other states are normal to transition through but not to persist in
             "$enum":[
                "reading_coordinated_state",
@@ -402,6 +470,7 @@
          },
          "required_logs":3,
          "missing_logs":"7f8d623d0cb9966e",
+         "active_generations":1,
          "description":"Recovery complete."
       },
       "workload":{
@@ -411,18 +480,28 @@
                "counter":0,
                "roughness":0.0
             },
-            "reads":{
+            "reads":{ // measures number of completed read requests
                "hz":0.0,
                "counter":0,
                "roughness":0.0
             },
-            "read_requests":{
+            "read_requests":{ // measures number of incoming read requests
+               "hz":0.0,
+               "counter":0,
+               "roughness":0.0
+            },
+            "location_requests":{ // measures number of outgoing key server location responses
+               "hz":0.0,
+               "counter":0,
+               "roughness":0.0
+            },
+            "memory_errors":{ // measures number of proxy_memory_limit_exceeded errors
                "hz":0.0,
                "counter":0,
                "roughness":0.0
             }
          },
-         "bytes":{ // of operations (independent of hz). Perfectly spaced operations will have a roughness of 1.0 . Randomly spaced (Poisson-distributed) operations will have a roughness of 2.0, with increased bunching resulting in increased values. Higher roughness can result in increased latency due to increased queuing.
+         "bytes":{ // measures number of logical bytes read/written (ignoring replication factor and overhead on disk). Perfectly spaced operations will have a roughness of 1.0. Randomly spaced (Poisson-distributed) operations will have a roughness of 2.0, with increased bunching resulting in increased values. Higher roughness can result in increased latency due to increased queuing.
             "written":{
                "hz":0.0,
                "counter":0,
@@ -483,6 +562,7 @@
       "data_distribution_disabled_for_ss_failures":true,
       "data_distribution_disabled_for_rebalance":true,
       "data_distribution_disabled":true,
+      "active_primary_dc":"pv",
       "configuration":{
          "log_anti_quorum":0,
          "log_replicas":2,
@@ -501,7 +581,8 @@
          "datacenters":[{
              "id":"mr",
              "priority":1,
-             "satellite":1
+             "satellite":1,
+             "satellite_logs":2
          }],
          "satellite_redundancy_mode":{
          "$enum":[
@@ -543,6 +624,7 @@
              "ssd-1",
              "ssd-2",
              "ssd-redwood-experimental",
+             "ssd-rocksdb-experimental",
              "memory"
          ]},
          "coordinators_count":1,
@@ -551,10 +633,11 @@
                "address":"10.0.4.1"
             }
          ],
-         "auto_proxies":3,
+         "auto_commit_proxies":3,
          "auto_resolvers":1,
          "auto_logs":3,
-         "proxies":5 // this field will be absent if a value has not been explicitly set
+         "backup_worker_enabled":1,
+         "commit_proxies":5 // this field will be absent if a value has not been explicitly set
       },
       "data":{
          "least_operating_space_bytes_log_server":0,
@@ -568,6 +651,7 @@
                   "missing_data",
                   "healing",
                   "optimizing_team_collections",
+                  "healthy_populating_region",
                   "healthy_repartitioning",
                   "healthy_removing_server",
                   "healthy_rebalancing",
@@ -583,9 +667,9 @@
          "system_kv_size_bytes":0, // estimated
          "partitions_count":2,
          "moving_data":{
-            "total_written_bytes":0,
-            "in_flight_bytes":0,
-            "in_queue_bytes":0,
+            "total_written_bytes":0, // reset whenever data distributor is re-recruited
+            "in_flight_bytes":0, // number of bytes currently being moved between storage servers
+            "in_queue_bytes":0, // number of bytes in the data distributor queue that should be moved (but are not yet being transferred between storage servers)
             "highest_priority":0
          },
          "team_trackers":[
@@ -602,6 +686,7 @@
                           "missing_data",
                           "healing",
                           "optimizing_team_collections",
+                          "healthy_populating_region",
                           "healthy_repartitioning",
                           "healthy_removing_server",
                           "healthy_rebalancing",
@@ -630,7 +715,7 @@
             },
             "memory":{
                "free_bytes":0, // an estimate of how many bytes are free to allocate to fdbservers without swapping
-               "committed_bytes":0,
+               "committed_bytes":0, // an estimate of the number of bytes of memory on the machine that are not free for allocation
                "total_bytes":0 // an estimate of total physical RAM
             },
             "contributing_workers":4,

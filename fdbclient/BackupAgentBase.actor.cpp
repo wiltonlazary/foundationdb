@@ -131,7 +131,7 @@ bool copyParameter(Reference<Task> source, Reference<Task> dest, Key key) {
 }
 
 Version getVersionFromString(std::string const& value) {
-	Version version(-1);
+	Version version = invalidVersion;
 	int n = 0;
 	if (sscanf(value.c_str(), "%lld%n", (long long*)&version, &n) != 1 || n != value.size()) {
 		TraceEvent(SevWarnAlways, "GetVersionFromString").detail("InvalidVersion", value);
@@ -144,6 +144,7 @@ Version getVersionFromString(std::string const& value) {
 // \xff / bklog / keyspace in a funny order for performance reasons.
 // Return the ranges of keys that contain the data for the given range
 // of versions.
+// assert CLIENT_KNOBS->LOG_RANGE_BLOCK_SIZE % blocksize = 0. Otherwise calculation of hash will be incorrect
 Standalone<VectorRef<KeyRangeRef>> getLogRanges(Version beginVersion, Version endVersion, Key destUidValue, int blockSize) {
 	Standalone<VectorRef<KeyRangeRef>> ret;
 
@@ -200,76 +201,17 @@ Key getApplyKey( Version version, Key backupUid ) {
 	return k2.withPrefix(applyLogKeys.begin);
 }
 
+Version getLogKeyVersion(Key key) {
+	return bigEndian64(*(int64_t*)(key.begin() + backupLogPrefixBytes + sizeof(UID) + sizeof(uint8_t)));
+}
+
 //Given a key from one of the ranges returned by get_log_ranges,
 //returns(version, part) where version is the database version number of
 //the transaction log data in the value, and part is 0 for the first such
 //data for a given version, 1 for the second block of data, etc.
-std::pair<uint64_t, uint32_t> decodeBKMutationLogKey(Key key) {
-	return std::make_pair(bigEndian64(*(int64_t*)(key.begin() + backupLogPrefixBytes + sizeof(UID) + sizeof(uint8_t))),
+std::pair<Version, uint32_t> decodeBKMutationLogKey(Key key) {
+	return std::make_pair(getLogKeyVersion(key),
 		bigEndian32(*(int32_t*)(key.begin() + backupLogPrefixBytes + sizeof(UID) + sizeof(uint8_t) + sizeof(int64_t))));
-}
-
-// value is an iterable representing all of the transaction log data for
-// a given version.Returns an iterable(generator) yielding a tuple for
-// each mutation in the log.At present, all mutations are represented as
-// (type, param1, param2) where type is an integer and param1 and param2 are byte strings
-Standalone<VectorRef<MutationRef>> decodeBackupLogValue(StringRef value) {
-	try {
-		uint64_t offset(0);
-		uint64_t protocolVersion = 0;
-		memcpy(&protocolVersion, value.begin(), sizeof(uint64_t));
-		offset += sizeof(uint64_t);
-		if (protocolVersion <= 0x0FDB00A200090001){
-			TraceEvent(SevError, "DecodeBackupLogValue").detail("IncompatibleProtocolVersion", protocolVersion)
-				.detail("ValueSize", value.size()).detail("Value", value);
-			throw incompatible_protocol_version();
-		}
-
-		Standalone<VectorRef<MutationRef>> result;
-		uint32_t totalBytes = 0;
-		memcpy(&totalBytes, value.begin() + offset, sizeof(uint32_t));
-		offset += sizeof(uint32_t);
-		uint32_t consumed = 0;
-
-		if(totalBytes + offset > value.size())
-			throw restore_missing_data();
-
-		int originalOffset = offset;
-
-		while (consumed < totalBytes){
-			uint32_t type = 0;
-			memcpy(&type, value.begin() + offset, sizeof(uint32_t));
-			offset += sizeof(uint32_t);
-			uint32_t len1 = 0;
-			memcpy(&len1, value.begin() + offset, sizeof(uint32_t));
-			offset += sizeof(uint32_t);
-			uint32_t len2 = 0;
-			memcpy(&len2, value.begin() + offset, sizeof(uint32_t));
-			offset += sizeof(uint32_t);
-
-			MutationRef logValue;
-			logValue.type = type;
-			logValue.param1 = value.substr(offset, len1);
-			offset += len1;
-			logValue.param2 = value.substr(offset, len2);
-			offset += len2;
-			result.push_back_deep(result.arena(), logValue);
-
-			consumed += BackupAgentBase::logHeaderSize + len1 + len2;
-		}
-
-		ASSERT(consumed == totalBytes);
-		if (value.size() != offset) {
-			TraceEvent(SevError, "BA_DecodeBackupLogValue").detail("UnexpectedExtraDataSize", value.size()).detail("Offset", offset).detail("TotalBytes", totalBytes).detail("Consumed", consumed).detail("OriginalOffset", originalOffset);
-			throw restore_corrupted_data();
-		}
-
-		return result;
-	}
-	catch (Error& e) {
-		TraceEvent(e.code() == error_code_restore_missing_data ? SevWarn : SevError, "BA_DecodeBackupLogValue").error(e).GetLastError().detail("ValueSize", value.size()).detail("Value", value);
-		throw;
-	}
 }
 
 void decodeBackupLogValue(Arena& arena, VectorRef<MutationRef>& result, int& mutationSize, StringRef value, StringRef addPrefix, StringRef removePrefix, Version version, Reference<KeyRangeMap<Version>> key_version) {
@@ -379,7 +321,9 @@ void decodeBackupLogValue(Arena& arena, VectorRef<MutationRef>& result, int& mut
 		throw;
 	}
 }
+
 static double lastErrorTime = 0;
+
 void logErrorWorker(Reference<ReadYourWritesTransaction> tr, Key keyErrors, std::string message) {
 	tr->setOption(FDBTransactionOptions::ACCESS_SYSTEM_KEYS);
 	tr->setOption(FDBTransactionOptions::LOCK_AWARE);
@@ -410,7 +354,10 @@ ACTOR Future<Void> readCommitted(Database cx, PromiseStream<RangeResultWithVersi
 
 	loop{
 		try {
-			state GetRangeLimits limits(CLIENT_KNOBS->ROW_LIMIT_UNLIMITED, (g_network->isSimulated() && !g_simulator.speedUpSimulation) ? CLIENT_KNOBS->BACKUP_SIMULATED_LIMIT_BYTES : CLIENT_KNOBS->BACKUP_GET_RANGE_LIMIT_BYTES);
+			state GetRangeLimits limits(GetRangeLimits::ROW_LIMIT_UNLIMITED,
+			                            (g_network->isSimulated() && !g_simulator.speedUpSimulation)
+			                                ? CLIENT_KNOBS->BACKUP_SIMULATED_LIMIT_BYTES
+			                                : CLIENT_KNOBS->BACKUP_GET_RANGE_LIMIT_BYTES);
 
 			if (systemAccess)
 				tr.setOption(FDBTransactionOptions::ACCESS_SYSTEM_KEYS);
@@ -474,7 +421,10 @@ ACTOR Future<Void> readCommitted(Database cx, PromiseStream<RCGroup> results, Fu
 
 	loop{
 		try {
-			state GetRangeLimits limits(CLIENT_KNOBS->ROW_LIMIT_UNLIMITED, (g_network->isSimulated() && !g_simulator.speedUpSimulation) ? CLIENT_KNOBS->BACKUP_SIMULATED_LIMIT_BYTES : CLIENT_KNOBS->BACKUP_GET_RANGE_LIMIT_BYTES);
+			state GetRangeLimits limits(GetRangeLimits::ROW_LIMIT_UNLIMITED,
+			                            (g_network->isSimulated() && !g_simulator.speedUpSimulation)
+			                                ? CLIENT_KNOBS->BACKUP_SIMULATED_LIMIT_BYTES
+			                                : CLIENT_KNOBS->BACKUP_GET_RANGE_LIMIT_BYTES);
 
 			if (systemAccess)
 				tr.setOption(FDBTransactionOptions::ACCESS_SYSTEM_KEYS);
@@ -812,6 +762,16 @@ ACTOR static Future<Void> _eraseLogData(Reference<ReadYourWritesTransaction> tr,
 		// Disable committing mutations into blog
 		tr->clear(prefixRange(destUidValue.withPrefix(logRangesRange.begin)));
 	}
+	
+	if(!endVersion.present() && backupVersions.size() == 1) {
+		Standalone<RangeResultRef> existingDestUidValues = wait(tr->getRange(KeyRangeRef(destUidLookupPrefix, strinc(destUidLookupPrefix)), CLIENT_KNOBS->TOO_MANY));
+		for(auto it : existingDestUidValues) {
+			if( it.value == destUidValue ) {
+				tr->clear(it.key);
+			}
+		}
+	}
+
 	return Void();
 }
 
@@ -852,29 +812,33 @@ ACTOR Future<Void> cleanupLogMutations(Database cx, Value destUidValue, bool del
 					wait(success(foundDRKey) && success(foundBackupKey));
 
 					if(foundDRKey.get().present() && foundBackupKey.get().present()) {
-							printf("WARNING: Found a tag which looks like both a backup and a DR. This tag was %.4f hours behind.\n", (readVer - currVersion)/(3600.0*CLIENT_KNOBS->CORE_VERSIONSPERSECOND));
+							printf("WARNING: Found a tag that looks like both a backup and a DR. This tag is %.4f hours behind.\n", (readVer - currVersion)/(3600.0*CLIENT_KNOBS->CORE_VERSIONSPERSECOND));
 					} else if(foundDRKey.get().present() && !foundBackupKey.get().present()) {
-							printf("Found a DR which was %.4f hours behind.\n", (readVer - currVersion)/(3600.0*CLIENT_KNOBS->CORE_VERSIONSPERSECOND));
+							printf("Found a DR that is %.4f hours behind.\n", (readVer - currVersion)/(3600.0*CLIENT_KNOBS->CORE_VERSIONSPERSECOND));
 					} else if(!foundDRKey.get().present() && foundBackupKey.get().present()) {
-							printf("Found a Backup which was %.4f hours behind.\n", (readVer - currVersion)/(3600.0*CLIENT_KNOBS->CORE_VERSIONSPERSECOND));
+							printf("Found a Backup that is %.4f hours behind.\n", (readVer - currVersion)/(3600.0*CLIENT_KNOBS->CORE_VERSIONSPERSECOND));
 					} else {
-						printf("WARNING: Found a unknown tag which was %.4f hours behind.\n", (readVer - currVersion)/(3600.0*CLIENT_KNOBS->CORE_VERSIONSPERSECOND));
+						printf("WARNING: Found an unknown tag that is %.4f hours behind.\n", (readVer - currVersion)/(3600.0*CLIENT_KNOBS->CORE_VERSIONSPERSECOND));
 					}
 					loggedLogUids.insert(currLogUid);
 				}
 			}
 
-			if( readVer - minVersion > CLIENT_KNOBS->MIN_CLEANUP_SECONDS*CLIENT_KNOBS->CORE_VERSIONSPERSECOND && deleteData && (!removingLogUid.present() || minVersionLogUid == removingLogUid.get()) ) {
-				removingLogUid = minVersionLogUid;
-				wait(eraseLogData(tr, minVersionLogUid, destUidValue));
-				wait(tr->commit());
-				printf("\nSuccessfully removed the tag which was %.4f hours behind.\n", (readVer - minVersion)/(3600.0*CLIENT_KNOBS->CORE_VERSIONSPERSECOND));
-			} else if(removingLogUid.present() && minVersionLogUid != removingLogUid.get()) { 
-				printf("\nWARNING: The oldest tag was possibly removed, run again without `--delete_data' to check.\n");
-			} else if( deleteData ) {
-				printf("\nWARNING: Did not delete data because the tag was not at least %.4f hours behind. Change `--min_cleanup_seconds' to adjust this threshold.\n", CLIENT_KNOBS->MIN_CLEANUP_SECONDS/3600.0);
+			if(deleteData) {
+				if(readVer - minVersion > CLIENT_KNOBS->MIN_CLEANUP_SECONDS*CLIENT_KNOBS->CORE_VERSIONSPERSECOND && (!removingLogUid.present() || minVersionLogUid == removingLogUid.get())) {
+					removingLogUid = minVersionLogUid;
+					wait(eraseLogData(tr, minVersionLogUid, destUidValue));
+					wait(tr->commit());
+					printf("\nSuccessfully removed the tag that was %.4f hours behind.\n\n", (readVer - minVersion)/(3600.0*CLIENT_KNOBS->CORE_VERSIONSPERSECOND));
+				} else if(removingLogUid.present() && minVersionLogUid != removingLogUid.get()) {
+					printf("\nWARNING: The oldest tag was possibly removed, run again without `--delete_data' to check.\n\n");
+				} else {
+					printf("\nWARNING: Did not delete data because the tag is not at least %.4f hours behind. Change `--min_cleanup_seconds' to adjust this threshold.\n\n", CLIENT_KNOBS->MIN_CLEANUP_SECONDS/3600.0);
+				}
+			} else if(readVer - minVersion > CLIENT_KNOBS->MIN_CLEANUP_SECONDS*CLIENT_KNOBS->CORE_VERSIONSPERSECOND) {
+				printf("\nPassing `--delete_data' would delete the tag that is %.4f hours behind.\n\n", (readVer - minVersion)/(3600.0*CLIENT_KNOBS->CORE_VERSIONSPERSECOND));
 			} else {
-				printf("\nPassing `--delete_data' would delete the tag which was %.4f hours behind.\n", (readVer - minVersion)/(3600.0*CLIENT_KNOBS->CORE_VERSIONSPERSECOND));
+				printf("\nPassing `--delete_data' would not delete the tag that is %.4f hours behind. Change `--min_cleanup_seconds' to adjust the cleanup threshold.\n\n", (readVer - minVersion)/(3600.0*CLIENT_KNOBS->CORE_VERSIONSPERSECOND));
 			}
 
 			return Void();

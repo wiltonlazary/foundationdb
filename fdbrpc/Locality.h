@@ -33,7 +33,8 @@ struct ProcessClass {
 		TransactionClass,
 		ResolutionClass,
 		TesterClass,
-		ProxyClass,
+		CommitProxyClass,
+		GrvProxyClass,
 		MasterClass,
 		StatelessClass,
 		LogClass,
@@ -43,11 +44,27 @@ struct ProcessClass {
 		DataDistributorClass,
 		CoordinatorClass,
 		RatekeeperClass,
+		StorageCacheClass,
+		BackupClass,
 		InvalidClass = -1
 	};
 
 	enum Fitness { BestFit, GoodFit, UnsetFit, OkayFit, WorstFit, ExcludeFit, NeverAssign }; //cannot be larger than 7 because of leader election mask
-	enum ClusterRole { Storage, TLog, Proxy, Master, Resolver, LogRouter, ClusterController, DataDistributor, Ratekeeper, NoRole };
+	enum ClusterRole {
+		Storage,
+		TLog,
+		CommitProxy,
+		GrvProxy,
+		Master,
+		Resolver,
+		LogRouter,
+		ClusterController,
+		DataDistributor,
+		Ratekeeper,
+		StorageCache,
+		Backup,
+		NoRole
+	};
 	enum ClassSource { CommandLineSource, AutoSource, DBSource, InvalidSource = -1 };
 	int16_t _class;
 	int16_t _source;
@@ -60,7 +77,8 @@ public:
 		if (s=="storage") _class = StorageClass;
 		else if (s=="transaction") _class = TransactionClass;
 		else if (s=="resolution") _class = ResolutionClass;
-		else if (s=="proxy") _class = ProxyClass;
+		else if (s=="commit_proxy") _class = CommitProxyClass;
+		else if (s=="grv_proxy") _class = GrvProxyClass;
 		else if (s=="master") _class = MasterClass;
 		else if (s=="test") _class = TesterClass;
 		else if (s=="unset") _class = UnsetClass;
@@ -68,10 +86,12 @@ public:
 		else if (s=="log") _class = LogClass;
 		else if (s=="router") _class = LogRouterClass;
 		else if (s=="cluster_controller") _class = ClusterControllerClass;
-		else if (s == "fast_restore") _class = FastRestoreClass;
+		else if (s=="fast_restore") _class = FastRestoreClass;
 		else if (s=="data_distributor") _class = DataDistributorClass;
 		else if (s=="coordinator") _class = CoordinatorClass;
 		else if (s=="ratekeeper") _class = RatekeeperClass;
+		else if (s=="storage_cache") _class = StorageCacheClass;
+		else if (s=="backup") _class = BackupClass;
 		else _class = InvalidClass;
 	}
 
@@ -79,7 +99,8 @@ public:
 		if (classStr=="storage") _class = StorageClass;
 		else if (classStr=="transaction") _class = TransactionClass;
 		else if (classStr=="resolution") _class = ResolutionClass;
-		else if (classStr=="proxy") _class = ProxyClass;
+		else if (classStr=="commit_proxy") _class = CommitProxyClass;
+		else if (classStr=="grv_proxy") _class = GrvProxyClass;
 		else if (classStr=="master") _class = MasterClass;
 		else if (classStr=="test") _class = TesterClass;
 		else if (classStr=="unset") _class = UnsetClass;
@@ -91,6 +112,8 @@ public:
 		else if (classStr=="data_distributor") _class = DataDistributorClass;
 		else if (classStr=="coordinator") _class = CoordinatorClass;
 		else if (classStr=="ratekeeper") _class = RatekeeperClass;
+		else if (classStr=="storage_cache") _class = StorageCacheClass;
+		else if (classStr=="backup") _class = BackupClass;
 		else _class = InvalidClass;
 
 		if (sourceStr=="command_line") _source = CommandLineSource;
@@ -114,7 +137,8 @@ public:
 			case StorageClass: return "storage";
 			case TransactionClass: return "transaction";
 			case ResolutionClass: return "resolution";
-			case ProxyClass: return "proxy";
+			case CommitProxyClass: return "commit_proxy";
+			case GrvProxyClass: return "grv_proxy";
 			case MasterClass: return "master";
 			case TesterClass: return "test";
 			case StatelessClass: return "stateless";
@@ -125,6 +149,8 @@ public:
 			case DataDistributorClass: return "data_distributor";
 			case CoordinatorClass: return "coordinator";
 			case RatekeeperClass: return "ratekeeper";
+			case StorageCacheClass: return "storage_cache";
+			case BackupClass: return "backup";
 			default: return "invalid";
 		}
 	}
@@ -141,6 +167,7 @@ public:
 
 	Fitness machineClassFitness( ClusterRole role ) const ;
 
+	//To change this serialization, ProtocolVersion::ProcessClassValue must be updated, and downgrades need to be considered
 	template <class Ar>
 	void serialize(Ar& ar) {
 		serializer(ar, _class, _source);
@@ -170,6 +197,7 @@ public:
 		return ((_data.size() == rhs._data.size())													&&
 					  (std::equal(_data.begin(), _data.end(), rhs._data.begin())));
 	}
+	bool operator!=(LocalityData const& rhs) const { return !(*this == rhs); }
 
 	Optional<Standalone<StringRef>>	get(StringRef key) const {
 		auto pos = _data.find(key);
@@ -275,10 +303,10 @@ static std::string describe(
 	}
 	return s;
 }
-static 	std::string describeZones( std::vector<LocalityData> const& items, int max_items = -1 ) {
+inline std::string describeZones( std::vector<LocalityData> const& items, int max_items = -1 ) {
 	return describe(items, LocalityData::keyZoneId, max_items);
 }
-static 	std::string describeDataHalls( std::vector<LocalityData> const& items, int max_items = -1 ) {
+inline std::string describeDataHalls( std::vector<LocalityData> const& items, int max_items = -1 ) {
 	return describe(items, LocalityData::keyDataHallId, max_items);
 }
 
@@ -290,6 +318,7 @@ struct ProcessData {
 	ProcessData() {}
 	ProcessData( LocalityData locality, ProcessClass processClass, NetworkAddress address ) : locality(locality), processClass(processClass), address(address) {}
 
+	//To change this serialization, ProtocolVersion::WorkerListValue must be updated, and downgrades need to be considered
 	template <class Ar>
 	void serialize(Ar& ar) {
 		serializer(ar, locality, processClass, address);

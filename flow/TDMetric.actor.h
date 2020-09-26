@@ -28,7 +28,6 @@
         #define FLOW_TDMETRIC_ACTOR_H
 
 #include "flow/flow.h"
-#include "flow/IndexedSet.h"
 #include "flow/network.h"
 #include "flow/Knobs.h"
 #include "flow/genericactors.actor.h"
@@ -56,9 +55,21 @@ struct MetricNameRef {
 	int expectedSize() const {
 		return type.expectedSize() + name.expectedSize();
 	}
+
+	inline int compare(MetricNameRef const& r) const {
+		int cmp;
+		if ((cmp = type.compare(r.type))) {
+			return cmp;
+		}
+		if ((cmp = name.compare(r.name))) {
+			return cmp;
+		}
+		return id.compare(r.id);
+	}
 };
 
 extern std::string reduceFilename(std::string const &filename);
+
 inline bool operator < (const MetricNameRef& l, const MetricNameRef& r ) {
 	int cmp = l.type.compare(r.type);
 	if(cmp == 0) {
@@ -216,14 +227,10 @@ struct MetricData {
 		appendStart(appendStart) {
 	}
 
-	MetricData( MetricData&& r ) BOOST_NOEXCEPT :
-		start(r.start),
-		rollTime(r.rollTime),
-		appendStart(r.appendStart),
-		writer(std::move(r.writer)) {
-	}
+	MetricData(MetricData&& r) noexcept
+	  : start(r.start), rollTime(r.rollTime), appendStart(r.appendStart), writer(std::move(r.writer)) {}
 
-	void operator=( MetricData&& r ) BOOST_NOEXCEPT {
+	void operator=(MetricData&& r) noexcept {
 		start = r.start; rollTime = r.rollTime; appendStart = r.appendStart; writer = std::move(r.writer);
 	}
 
@@ -329,7 +336,7 @@ struct Descriptor {
 	using fields = std::tuple<>;
 	typedef make_index_sequence_impl<0, index_sequence<>, std::tuple_size<fields>::value>::type field_indexes;
 
-	static StringRef typeName() {{ return LiteralStringRef(""); }}
+	static StringRef typeName() { return LiteralStringRef(""); }
 #endif
 };
 
@@ -634,11 +641,9 @@ template <class T, class Descriptor = NullDescriptor, class FieldLevelType = Fie
 struct EventField : public Descriptor {
 	std::vector<FieldLevelType> levels;
 
-	EventField( EventField&& r ) BOOST_NOEXCEPT : Descriptor(r), levels(std::move(r.levels)) {}
+	EventField(EventField&& r) noexcept : Descriptor(r), levels(std::move(r.levels)) {}
 
-	void operator=( EventField&& r ) BOOST_NOEXCEPT {
-		levels = std::move(r.levels);
-	}
+	void operator=(EventField&& r) noexcept { levels = std::move(r.levels); }
 
 	EventField(Descriptor d = Descriptor()) : Descriptor(d) {
 	}
@@ -957,7 +962,7 @@ struct DynamicFieldBase {
 			.detail("FieldName", fieldName().toString())
 			.detail("OldType", getDerivedTypeName().toString())
 			.detail("NewType", metricTypeName<T>().toString());
-		return NULL;
+		return nullptr;
 	}
 };
 
@@ -1002,7 +1007,7 @@ struct DynamicField : public DynamicFieldBase, EventField<T, DynamicDescriptor> 
 	// Set this field's value to the value of another field of exactly the same type.
 	void setValueFrom(DynamicFieldBase *src, StringRef eventType) {
 		DynamicField<T> *s = src->safe_downcast<T>(eventType);
-		if(s != NULL)
+		if(s != nullptr)
 			set(s->value);
 		else
 			clear();  // Not really necessary with proper use but just in case it is better to clear than use an old value.
@@ -1068,7 +1073,7 @@ public:
 	void setField(const char *fieldName, const ValueType &value) {
 		StringRef fname((uint8_t *)fieldName, strlen(fieldName));
 		DynamicFieldBase *&p = fields[fname];
-		if (p != NULL) {
+		if (p != nullptr) {
 			// FIXME:  This will break for DynamicEventMetric instances that are reused, such as use cases outside
 			// of TraceEvents.  Currently there are none in the code, and there may never any be but if you're here
 			// because you reused a DynamicEventMetric and got the error below then this issue must be fixed.  One
@@ -1082,12 +1087,12 @@ public:
 			p->init();
 		newFieldAdded(fname);
 
-		// This will return NULL if the datatype is wrong.
+		// This will return nullptr if the datatype is wrong.
 		DynamicField<ValueType> *f = p->safe_downcast<ValueType>(getTypeName());
 		// Only set the field value if the type is correct.
 		// Another option here is to redefine the field to the new type and flush (roll) the existing field but that would create many keys
 		// with small values in the db if two frequent events keep tug-of-war'ing the types back and forth.
-		if(f != NULL)
+		if(f != nullptr)
 			f->set(value);
 		else
 			p->clear();  // Not really necessary with proper use but just in case it is better to clear than use an old value.
@@ -1099,7 +1104,7 @@ public:
 		for(auto f : source->fields)
 		{
 			DynamicFieldBase *&p = fields[f.first];
-			if(p == NULL) {
+			if(p == nullptr) {
 				p = f.second->createNewWithValue(f.first.toString().c_str());
 				if(pCollection != nullptr)
 					p->init();
@@ -1350,10 +1355,11 @@ typedef ContinuousMetric<Standalone<StringRef>> StringMetric;
 //
 template <typename T>
 struct MetricHandle {
-	template<typename ValueType = typename T::ValueType>
-	MetricHandle(StringRef const &name = StringRef(), StringRef const &id = StringRef(), ValueType const &initial = ValueType())
-	  : ref(T::getOrCreateInstance(name, id, true, initial)) {
-	}
+	using ValueType = typename T::ValueType;
+
+	MetricHandle(StringRef const& name = StringRef(), StringRef const& id = StringRef(),
+	             ValueType const& initial = ValueType())
+	  : ref(T::getOrCreateInstance(name, id, true, initial)) {}
 
 	// Initialize this handle to point to a new or existing metric with (name, id).  If a new metric is created then the handle's
 	// current metric's current value will be the new metric's initial value.  This allows Metric handle users to treate their

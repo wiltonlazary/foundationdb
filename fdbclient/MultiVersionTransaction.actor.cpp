@@ -145,6 +145,20 @@ ThreadFuture<Standalone<StringRef>> DLTransaction::getVersionstamp() {
 	});
 }
 
+ThreadFuture<int64_t> DLTransaction::getEstimatedRangeSizeBytes(const KeyRangeRef& keys) {
+	if (!api->transactionGetEstimatedRangeSizeBytes) {
+		return unsupported_operation();
+	}
+	FdbCApi::FDBFuture *f = api->transactionGetEstimatedRangeSizeBytes(tr, keys.begin.begin(), keys.begin.size(), keys.end.begin(), keys.end.size());
+
+	return toThreadFuture<int64_t>(api, f, [](FdbCApi::FDBFuture *f, FdbCApi *api) {
+		int64_t sampledSize;
+		FdbCApi::fdb_error_t error = api->futureGetInt64(f, &sampledSize);
+		ASSERT(!error);
+		return sampledSize;
+	});
+}
+
 void DLTransaction::addReadConflictRange(const KeyRangeRef& keys) {
 	throwIfError(api->transactionAddConflictRange(tr, keys.begin.begin(), keys.begin.size(), keys.end.begin(), keys.end.size(), FDBConflictRangeTypes::READ));
 }
@@ -210,7 +224,7 @@ ThreadFuture<int64_t> DLTransaction::getApproximateSize() {
 }
 
 void DLTransaction::setOption(FDBTransactionOptions::Option option, Optional<StringRef> value) {
-	throwIfError(api->transactionSetOption(tr, option, value.present() ? value.get().begin() : NULL, value.present() ? value.get().size() : 0));
+	throwIfError(api->transactionSetOption(tr, option, value.present() ? value.get().begin() : nullptr, value.present() ? value.get().size() : 0));
 }
 
 ThreadFuture<Void> DLTransaction::onError(Error const& e) {
@@ -248,14 +262,14 @@ Reference<ITransaction> DLDatabase::createTransaction() {
 }
 
 void DLDatabase::setOption(FDBDatabaseOptions::Option option, Optional<StringRef> value) {
-	throwIfError(api->databaseSetOption(db, option, value.present() ? value.get().begin() : NULL, value.present() ? value.get().size() : 0));
+	throwIfError(api->databaseSetOption(db, option, value.present() ? value.get().begin() : nullptr, value.present() ? value.get().size() : 0));
 }
 	
 // DLApi
 template<class T>
 void loadClientFunction(T *fp, void *lib, std::string libPath, const char *functionName, bool requireFunction = true) {
 	*(void**)(fp) = loadFunction(lib, functionName);
-	if(*fp == NULL && requireFunction) {
+	if(*fp == nullptr && requireFunction) {
 		TraceEvent(SevError, "ErrorLoadingFunction").detail("LibraryPath", libPath).detail("Function", functionName);
 		throw platform_error();
 	}
@@ -269,7 +283,7 @@ void DLApi::init() {
 	}
 
 	void* lib = loadLibrary(fdbCPath.c_str());
-	if(lib == NULL) {
+	if(lib == nullptr) {
 		TraceEvent(SevError, "ErrorLoadingExternalClientLibrary").detail("LibraryPath", fdbCPath);
 		throw platform_error();
 	}
@@ -307,6 +321,7 @@ void DLApi::init() {
 	loadClientFunction(&api->transactionReset, lib, fdbCPath, "fdb_transaction_reset");
 	loadClientFunction(&api->transactionCancel, lib, fdbCPath, "fdb_transaction_cancel");
 	loadClientFunction(&api->transactionAddConflictRange, lib, fdbCPath, "fdb_transaction_add_conflict_range");
+	loadClientFunction(&api->transactionGetEstimatedRangeSizeBytes, lib, fdbCPath, "fdb_transaction_get_estimated_range_size_bytes", headerVersion >= 630);
 
 	loadClientFunction(&api->futureGetInt64, lib, fdbCPath, headerVersion >= 620 ? "fdb_future_get_int64" : "fdb_future_get_version");
 	loadClientFunction(&api->futureGetError, lib, fdbCPath, "fdb_future_get_error");
@@ -332,7 +347,7 @@ void DLApi::selectApiVersion(int apiVersion) {
 
 	init();
 	throwIfError(api->selectApiVersion(apiVersion, headerVersion));
-	throwIfError(api->setNetworkOption(FDBNetworkOptions::EXTERNAL_CLIENT, NULL, 0));
+	throwIfError(api->setNetworkOption(FDBNetworkOptions::EXTERNAL_CLIENT, nullptr, 0));
 }
 
 const char* DLApi::getClientVersion() {
@@ -344,7 +359,7 @@ const char* DLApi::getClientVersion() {
 }
 
 void DLApi::setNetworkOption(FDBNetworkOptions::Option option, Optional<StringRef> value) {
-	throwIfError(api->setNetworkOption(option, value.present() ? value.get().begin() : NULL, value.present() ? value.get().size() : 0));
+	throwIfError(api->setNetworkOption(option, value.present() ? value.get().begin() : nullptr, value.present() ? value.get().size() : 0));
 }
 
 void DLApi::setupNetwork() {
@@ -547,6 +562,12 @@ void MultiVersionTransaction::addReadConflictRange(const KeyRangeRef& keys) {
 	}
 }
 
+ThreadFuture<int64_t> MultiVersionTransaction::getEstimatedRangeSizeBytes(const KeyRangeRef& keys) {
+	auto tr = getTransaction();
+	auto f = tr.transaction ? tr.transaction->getEstimatedRangeSizeBytes(keys) : ThreadFuture<int64_t>(Never());
+	return abortableFuture(f, tr.onChange);
+}
+
 void MultiVersionTransaction::atomicOp(const KeyRef& key, const ValueRef& value, uint32_t operationType) {
 	auto tr = getTransaction();
 	if(tr.transaction) {
@@ -746,15 +767,16 @@ void MultiVersionDatabase::Connector::connect() {
 				}
 
 				tr = candidateDatabase->createTransaction();
-				return ErrorOr<ThreadFuture<Void>>(mapThreadFuture<Version, Void>(tr->getReadVersion(), [this](ErrorOr<Version> v) {
-					// If the version attempt returns an error, we regard that as a connection (except operation_cancelled)
-					if(v.isError() && v.getError().code() == error_code_operation_cancelled) {
-						return ErrorOr<Void>(v.getError());
-					}
-					else {
-						return ErrorOr<Void>(Void());
-					}
-				}));
+				return ErrorOr<ThreadFuture<Void>>(
+				    mapThreadFuture<Version, Void>(tr->getReadVersion(), [](ErrorOr<Version> v) {
+					    // If the version attempt returns an error, we regard that as a connection (except
+					    // operation_cancelled)
+					    if (v.isError() && v.getError().code() == error_code_operation_cancelled) {
+						    return ErrorOr<Void>(v.getError());
+					    } else {
+						    return ErrorOr<Void>(Void());
+					    }
+				    }));
 			});
 
 
@@ -764,7 +786,7 @@ void MultiVersionDatabase::Connector::connect() {
 		else {
 			delref();
 		}
-	}, NULL);
+	}, nullptr);
 }
 
 // Only called from main thread
@@ -783,7 +805,7 @@ void MultiVersionDatabase::Connector::fire(const Void &unused, int& userParam) {
 			dbState->stateChanged();
 		}
 		delref();
-	}, NULL);
+	}, nullptr);
 }
 
 void MultiVersionDatabase::Connector::error(const Error& e, int& userParam) {
@@ -798,7 +820,7 @@ void MultiVersionDatabase::Connector::error(const Error& e, int& userParam) {
 }
 
 MultiVersionDatabase::DatabaseState::DatabaseState()
-	: dbVar(new ThreadSafeAsyncVar<Reference<IDatabase>>(Reference<IDatabase>(NULL))), currentClientIndex(-1) {}
+	: dbVar(new ThreadSafeAsyncVar<Reference<IDatabase>>(Reference<IDatabase>(nullptr))), currentClientIndex(-1) {}
 
 // Only called from main thread
 void MultiVersionDatabase::DatabaseState::stateChanged() {
@@ -876,7 +898,7 @@ void MultiVersionDatabase::DatabaseState::cancelConnections() {
 		connectionAttempts.clear();
 		clients.clear();
 		delref();
-	}, NULL);
+	}, nullptr);
 }
 
 // MultiVersionApi
@@ -1021,10 +1043,10 @@ void MultiVersionApi::setSupportedClientVersions(Standalone<StringRef> versions)
 	// This option must be set on the main thread because it modifes structures that can be used concurrently by the main thread
 	onMainThreadVoid([this, versions](){
 		localClient->api->setNetworkOption(FDBNetworkOptions::SUPPORTED_CLIENT_VERSIONS, versions);
-	}, NULL);
+	}, nullptr);
 
 	if(!bypassMultiClientApi) {
-		runOnExternalClients([this, versions](Reference<ClientInfo> client){
+		runOnExternalClients([versions](Reference<ClientInfo> client) {
 			client->api->setNetworkOption(FDBNetworkOptions::SUPPORTED_CLIENT_VERSIONS, versions);
 		});
 	}
@@ -1084,9 +1106,8 @@ void MultiVersionApi::setNetworkOptionInternal(FDBNetworkOptions::Option option,
 
 		if(!bypassMultiClientApi) {
 			if(networkSetup) {
-				runOnExternalClients([this, option, value](Reference<ClientInfo> client) {
-					client->api->setNetworkOption(option, value);
-				});
+				runOnExternalClients(
+				    [option, value](Reference<ClientInfo> client) { client->api->setNetworkOption(option, value); });
 			}
 			else {
 				options.push_back(std::make_pair(option, value.castTo<Standalone<StringRef>>()));
@@ -1357,7 +1378,7 @@ void ClientInfo::loadProtocolVersion() {
 	}
 
 	char *next;
-	std::string protocolVersionStr = ClientVersionRef(version).protocolVersion.toString();
+	std::string protocolVersionStr = ClientVersionRef(StringRef(version)).protocolVersion.toString();
 	protocolVersion = ProtocolVersion(strtoull(protocolVersionStr.c_str(), &next, 16));
 
 	ASSERT(protocolVersion.version() != 0 && protocolVersion.version() != ULLONG_MAX);
@@ -1633,7 +1654,7 @@ THREAD_FUNC runSingleAssignmentVarTest(void *arg) {
 
 		onMainThreadVoid([done](){
 			*done = true;
-		}, NULL);
+		}, nullptr);
 	}
 	catch(Error &e) {
 		printf("Caught error in test: %s\n", e.name());

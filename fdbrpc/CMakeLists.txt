@@ -8,50 +8,45 @@ set(FDBRPC_SRCS
   AsyncFileCached.actor.cpp
   AsyncFileNonDurable.actor.cpp
   AsyncFileWriteChecker.cpp
-  batcher.actor.h
-  crc32c.cpp
   FailureMonitor.actor.cpp
   FlowTransport.actor.cpp
   genericactors.actor.h
   genericactors.actor.cpp
+  HealthMonitor.actor.cpp
   IAsyncFile.actor.cpp
   LoadBalance.actor.h
   Locality.cpp
   Net2FileSystem.cpp
   networksender.actor.h
-  Platform.cpp
   QueueModel.cpp
   ReplicationPolicy.cpp
   ReplicationTypes.cpp
   ReplicationUtils.cpp
+  Stats.actor.cpp
+  Stats.h
   sim2.actor.cpp
   sim_validation.cpp
   TimedRequest.h
-  TLSConnection.actor.cpp
   TraceFileIO.cpp)
 
 set(FDBRPC_THIRD_PARTY_SRCS
   libcoroutine/Common.c
-  libcoroutine/Coro.c
-  zlib/adler32.c
-  zlib/crc32.c
-  zlib/deflate.c
-  zlib/gzclose.c
-  zlib/gzlib.c
-  zlib/gzread.c
-  zlib/gzwrite.c
-  zlib/infback.c
-  zlib/inffast.c
-  zlib/inflate.c
-  zlib/inftrees.c
-  zlib/trees.c
-  zlib/zutil.c)
+  libcoroutine/Coro.c)
 
 if(APPLE)
   list(APPEND FDBRPC_THIRD_PARTY_SRCS libcoroutine/asm.S)
 endif()
 if(NOT WIN32)
-  list(APPEND FDBRPC_THIRD_PARTY_SRCS libcoroutine/context.c libeio/eio.c)
+  if(CMAKE_SYSTEM_NAME STREQUAL "FreeBSD")
+    find_library(EIO eio)
+    if(EIO)
+      list(APPEND FDBRPC_THIRD_PARTY_SRCS libcoroutine/context.c)
+    else()
+      list(APPEND FDBRPC_THIRD_PARTY_SRCS libcoroutine/context.c libeio/eio.c)
+    endif()
+  else()
+    list(APPEND FDBRPC_THIRD_PARTY_SRCS libcoroutine/context.c libeio/eio.c)
+  endif()
 endif()
 
 add_library(thirdparty STATIC ${FDBRPC_THIRD_PARTY_SRCS})

@@ -25,6 +25,7 @@
 
 #include "flow/DeterministicRandom.h"
 #include "flow/SystemMonitor.h"
+#include "flow/TLSConfig.actor.h"
 #include "flow/actorcompiler.h" // This must be the last #include.
 
 using namespace FDB;
@@ -35,7 +36,7 @@ THREAD_FUNC networkThread(void* fdb) {
 }
 
 ACTOR Future<Void> _test() {
-	API *fdb = FDB::API::selectAPIVersion(620);
+	API *fdb = FDB::API::selectAPIVersion(700);
 	auto db = fdb->createDatabase();
 	state Reference<Transaction> tr = db->createTransaction();
 
@@ -78,11 +79,11 @@ ACTOR Future<Void> _test() {
 }
 
 void fdb_flow_test() {
-	API *fdb = FDB::API::selectAPIVersion(620);
+	API *fdb = FDB::API::selectAPIVersion(700);
 	fdb->setupNetwork();
 	startThread(networkThread, fdb);
 
-	g_network = newNet2( false );
+	g_network = newNet2(TLSConfig());
 
 	openTraceFile(NetworkAddress(), 1000000, 1000000, ".");
 	systemMonitor();
@@ -131,6 +132,8 @@ namespace FDB {
 													   GetRangeLimits limits = GetRangeLimits(), bool snapshot = false,
 													   bool reverse = false,
 													   FDBStreamingMode streamingMode = FDB_STREAMING_MODE_SERIAL) override;
+		
+		Future<int64_t> getEstimatedRangeSizeBytes(const KeyRange& keys) override;
 
 		void addReadConflictRange(KeyRangeRef const& keys) override;
 		void addReadConflictKey(KeyRef const& key) override;
@@ -154,16 +157,16 @@ namespace FDB {
 		void cancel() override;
 		void reset() override;
 
-		TransactionImpl() : tr(NULL) {}
-		TransactionImpl(TransactionImpl&& r) BOOST_NOEXCEPT {
-			tr = r.tr;
-			r.tr = NULL;
-		}
-		TransactionImpl& operator=(TransactionImpl&& r) BOOST_NOEXCEPT {
-			tr = r.tr;
-			r.tr = NULL;
+		TransactionImpl() : tr(nullptr) {}
+	    TransactionImpl(TransactionImpl&& r) noexcept {
+		    tr = r.tr;
+		    r.tr = nullptr;
+	    }
+	    TransactionImpl& operator=(TransactionImpl&& r) noexcept {
+		    tr = r.tr;
+		    r.tr = nullptr;
 			return *this;
-		}
+	    }
 
 	private:
 		FDBTransaction* tr;
@@ -204,10 +207,10 @@ namespace FDB {
 		if ( value.present() )
 			throw_on_error( fdb_network_set_option( option, value.get().begin(), value.get().size() ) );
 		else
-			throw_on_error( fdb_network_set_option( option, NULL, 0 ) );
+			throw_on_error( fdb_network_set_option( option, nullptr, 0 ) );
 	}
 
-	API* API::instance = NULL;
+	API* API::instance = nullptr;
 	API::API(int version) : version(version) {}
 
 	API* API::selectAPIVersion(int apiVersion) {
@@ -231,11 +234,11 @@ namespace FDB {
 	}
 
 	bool API::isAPIVersionSelected() {
-		return API::instance != NULL;
+		return API::instance != nullptr;
 	}
 
 	API* API::getInstance() {
-		if(API::instance == NULL) {
+		if(API::instance == nullptr) {
 			throw api_version_unset();
 		}
 		else {
@@ -277,7 +280,7 @@ namespace FDB {
 		if (value.present())
 			throw_on_error(fdb_database_set_option(db, option, value.get().begin(), value.get().size()));
 		else
-			throw_on_error(fdb_database_set_option(db, option, NULL, 0));
+			throw_on_error(fdb_database_set_option(db, option, nullptr, 0));
 	}
 
 	TransactionImpl::TransactionImpl(FDBDatabase* db) {
@@ -345,6 +348,14 @@ namespace FDB {
 			} );
 	}
 
+	Future<int64_t> TransactionImpl::getEstimatedRangeSizeBytes(const KeyRange& keys) {
+		return backToFuture<int64_t>(fdb_transaction_get_estimated_range_size_bytes(tr, keys.begin.begin(), keys.begin.size(), keys.end.begin(), keys.end.size()), [](Reference<CFuture> f) {
+			int64_t bytes;
+			throw_on_error(fdb_future_get_int64(f->f, &bytes));
+			return bytes;
+		});
+	}
+
 	void TransactionImpl::addReadConflictRange(KeyRangeRef const& keys) {
 		throw_on_error( fdb_transaction_add_conflict_range( tr, keys.begin.begin(), keys.begin.size(), keys.end.begin(), keys.end.size(), FDB_CONFLICT_RANGE_TYPE_READ ) );
 	}
@@ -406,7 +417,7 @@ namespace FDB {
 		if ( value.present() ) {
 			throw_on_error( fdb_transaction_set_option( tr, option, value.get().begin(), value.get().size() ) );
 		} else {
-			throw_on_error( fdb_transaction_set_option( tr, option, NULL, 0 ) );
+			throw_on_error( fdb_transaction_set_option( tr, option, nullptr, 0 ) );
 		}
 	}
 

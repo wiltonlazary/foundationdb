@@ -31,32 +31,38 @@ struct ExtStringRef {
 	ExtStringRef() : extra_zero_bytes(0) {}
 	ExtStringRef( StringRef const& s, int extra_zero_bytes=0 ) : base( s ), extra_zero_bytes(extra_zero_bytes) {}
 
-	Standalone<StringRef> toStandaloneStringRef() {
+	Standalone<StringRef> toStandaloneStringRef() const {
 		auto s = makeString( size() );
-		memcpy( mutateString( s ), base.begin(), base.size() );
+		if (base.size() > 0) {
+			memcpy(mutateString(s), base.begin(), base.size());
+		}
 		memset( mutateString( s ) + base.size(), 0, extra_zero_bytes );
 		return s;
 	};
 
-	StringRef toArenaOrRef( Arena& a ) {
+	StringRef toArenaOrRef(Arena& a) const {
 		if (extra_zero_bytes) {
 			StringRef dest = StringRef( new(a) uint8_t[ size() ], size() );
-			memcpy( mutateString(dest), base.begin(), base.size() );
+			if (base.size() > 0) {
+				memcpy(mutateString(dest), base.begin(), base.size());
+			}
 			memset( mutateString(dest)+base.size(), 0, extra_zero_bytes );
 			return dest;
 		} else
 			return base;
 	}
 
-	StringRef assertRef() {
+	StringRef assertRef() const {
 		ASSERT( extra_zero_bytes == 0 );
 		return base;
 	}
 
-	StringRef toArena( Arena& a ) {
+	StringRef toArena(Arena& a) const {
 		if (extra_zero_bytes) {
 			StringRef dest = StringRef( new(a) uint8_t[ size() ], size() );
-			memcpy( mutateString(dest), base.begin(), base.size() );
+			if (base.size() > 0) {
+				memcpy(mutateString(dest), base.begin(), base.size());
+			}
 			memset( mutateString(dest)+base.size(), 0, extra_zero_bytes );
 			return dest;
 		} else
@@ -65,16 +71,18 @@ struct ExtStringRef {
 
 	int size() const { return base.size() + extra_zero_bytes; }
 
-	int cmp( ExtStringRef const& rhs ) const {
+	int compare(ExtStringRef const& rhs) const {
 		int cbl = std::min(base.size(), rhs.base.size());
-		int c = memcmp( base.begin(), rhs.base.begin(), cbl );
-		if (c!=0) return c;
+		if (cbl > 0) {
+			int c = memcmp(base.begin(), rhs.base.begin(), cbl);
+			if (c != 0) return c;
+		}
 
 		for(int i=cbl; i<base.size(); i++)
 			if (base[i]) return 1;
 		for(int i=cbl; i<rhs.base.size(); i++)
 			if (rhs.base[i]) return -1;
-		return size() - rhs.size();
+		return ::compare(size(), rhs.size());
 	}
 
 	bool startsWith( const ExtStringRef& s ) const { 
@@ -106,13 +114,21 @@ private:
 	int extra_zero_bytes;
 };
 inline bool operator == (const ExtStringRef& lhs, const ExtStringRef& rhs ) {
-	return lhs.size() == rhs.size() && !lhs.cmp(rhs);
+	return lhs.size() == rhs.size() && !lhs.compare(rhs);
 }
 inline bool operator != (const ExtStringRef& lhs, const ExtStringRef& rhs ) { return !(lhs==rhs); }
-inline bool operator < ( const ExtStringRef& lhs, const ExtStringRef& rhs ) { return lhs.cmp(rhs)<0; }
-inline bool operator > ( const ExtStringRef& lhs, const ExtStringRef& rhs ) { return lhs.cmp(rhs)>0; }
-inline bool operator <= ( const ExtStringRef& lhs, const ExtStringRef& rhs ) { return lhs.cmp(rhs)<=0; }
-inline bool operator >= ( const ExtStringRef& lhs, const ExtStringRef& rhs ) { return lhs.cmp(rhs)>=0; }
+inline bool operator<(const ExtStringRef& lhs, const ExtStringRef& rhs) {
+	return lhs.compare(rhs) < 0;
+}
+inline bool operator>(const ExtStringRef& lhs, const ExtStringRef& rhs) {
+	return lhs.compare(rhs) > 0;
+}
+inline bool operator<=(const ExtStringRef& lhs, const ExtStringRef& rhs) {
+	return lhs.compare(rhs) <= 0;
+}
+inline bool operator>=(const ExtStringRef& lhs, const ExtStringRef& rhs) {
+	return lhs.compare(rhs) >= 0;
+}
 
 template<>
 struct Traceable<ExtStringRef> : std::true_type {
@@ -144,25 +160,10 @@ private:
 		{
 			values.push_back( arena, kv );
 		}
+		int compare(Entry const& r) const { return ::compare(beginKey, r.beginKey); }
 		bool operator < (Entry const& r) const {
 			return beginKey < r.beginKey;
 		}
-		bool operator < (StringRef const& r) const {
-			return beginKey < r;
-		}
-		bool operator <= (Entry const& r) const {
-			return beginKey <= r.beginKey;
-		}
-		bool operator <= (StringRef const& r) const {
-			return beginKey <= r;
-		}
-		bool operator == (Entry const& r) const {
-			return beginKey == r.beginKey;
-		}
-		bool operator == (StringRef const& r) const {
-			return beginKey == r;
-		}
-
 		int segments() const { return 2*(values.size()+1); }
 	};
 
@@ -185,19 +186,19 @@ public:
 
 		enum SEGMENT_TYPE { UNKNOWN_RANGE, EMPTY_RANGE, KV };
 
-		SEGMENT_TYPE type() {
+		SEGMENT_TYPE type() const {
 			if (!offset) return UNKNOWN_RANGE;
 			if (offset&1) return EMPTY_RANGE;
 			return KV;
 		}
 
-		bool is_kv() { return type() == KV; }
-		bool is_unknown_range() { return type() == UNKNOWN_RANGE; }
-		bool is_empty_range() { return type() == EMPTY_RANGE; }
-		bool is_dependent() { return false; }
-		bool is_unreadable() { return false; }
+		bool is_kv() const { return type() == KV; }
+		bool is_unknown_range() const { return type() == UNKNOWN_RANGE; }
+		bool is_empty_range() const { return type() == EMPTY_RANGE; }
+		bool is_dependent() const { return false; }
+		bool is_unreadable() const { return false; }
 
-		ExtStringRef beginKey() {
+		ExtStringRef beginKey() const {
 			if (offset == 0) {
 				auto prev = it;
 				prev.decrementNonEnd();
@@ -207,7 +208,7 @@ public:
 			else
 				return ExtStringRef( it->values[ (offset-2)>>1 ].key, offset&1 );
 		}
-		ExtStringRef endKey() {
+		ExtStringRef endKey() const {
 			if (offset == 0)
 				return it->beginKey;
 			else if (offset == it->segments()-1)
@@ -216,7 +217,7 @@ public:
 				return ExtStringRef( it->values[ (offset-1)>>1 ].key, 1-(offset&1) );
 		}
 
-		const KeyValueRef* kv(Arena& arena) { // only if is_kv()
+		const KeyValueRef* kv(Arena& arena) const { // only if is_kv()
 			return &it->values[(offset - 2) >> 1];
 		}
 
@@ -244,6 +245,7 @@ public:
 		}
 
 		bool operator == ( const iterator& r ) const { return it == r.it && offset == r.offset; }
+		bool operator!=(const iterator& r) const { return !(*this == r); }
 
 		void skip( KeyRef key ) {      // Changes *this to the segment containing key (so that beginKey()<=key && key < endKey())
 			if( key == allKeys.end ) {
@@ -291,8 +293,12 @@ public:
 		entries.insert( Entry( allKeys.end, afterAllKeys, VectorRef<KeyValueRef>() ), NoMetric(), true );
 	}
 	// Visual Studio refuses to generate these, apparently despite the standard
-	SnapshotCache(SnapshotCache&& r) BOOST_NOEXCEPT : entries(std::move(r.entries)), arena(r.arena) {}
-	SnapshotCache& operator=(SnapshotCache&& r) BOOST_NOEXCEPT { entries = std::move(r.entries); arena = r.arena; return *this; }
+	SnapshotCache(SnapshotCache&& r) noexcept : entries(std::move(r.entries)), arena(r.arena) {}
+	SnapshotCache& operator=(SnapshotCache&& r) noexcept {
+		entries = std::move(r.entries);
+		arena = r.arena;
+		return *this;
+	}
 
 	bool empty() const {
 		// Returns true iff anything is known about the contents of the snapshot

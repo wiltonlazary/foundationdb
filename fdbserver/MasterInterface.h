@@ -37,21 +37,42 @@ struct MasterInterface {
 	RequestStream< struct TLogRejoinRequest > tlogRejoin; // sent by tlog (whether or not rebooted) to communicate with a new master
 	RequestStream< struct ChangeCoordinatorsRequest > changeCoordinators;
 	RequestStream< struct GetCommitVersionRequest > getCommitVersion;
+	RequestStream<struct BackupWorkerDoneRequest> notifyBackupWorkerDone;
+	// Get the centralized live committed version reported by commit proxies.
+	RequestStream< struct GetRawCommittedVersionRequest > getLiveCommittedVersion;
+	// Report a proxy's committed version.
+	RequestStream< struct ReportRawCommittedVersionRequest> reportLiveCommittedVersion;
 
 	NetworkAddress address() const { return changeCoordinators.getEndpoint().getPrimaryAddress(); }
+	NetworkAddressList addresses() const { return changeCoordinators.getEndpoint().addresses; }
 
 	UID id() const { return changeCoordinators.getEndpoint().token; }
 	template <class Archive>
 	void serialize(Archive& ar) {
 		if constexpr (!is_fb_function<Archive>) {
-                ASSERT( ar.protocolVersion().isValid() );
-        }
-		serializer(ar, locality, waitFailure, tlogRejoin, changeCoordinators, getCommitVersion);
+			ASSERT(ar.protocolVersion().isValid());
+		}
+		serializer(ar, locality, waitFailure);
+		if( Archive::isDeserializing ) {
+			tlogRejoin = RequestStream< struct TLogRejoinRequest >( waitFailure.getEndpoint().getAdjustedEndpoint(1) );
+			changeCoordinators = RequestStream< struct ChangeCoordinatorsRequest >( waitFailure.getEndpoint().getAdjustedEndpoint(2) );
+			getCommitVersion = RequestStream< struct GetCommitVersionRequest >( waitFailure.getEndpoint().getAdjustedEndpoint(3) );
+			notifyBackupWorkerDone = RequestStream<struct BackupWorkerDoneRequest>( waitFailure.getEndpoint().getAdjustedEndpoint(4) );
+			getLiveCommittedVersion = RequestStream< struct GetRawCommittedVersionRequest >( waitFailure.getEndpoint().getAdjustedEndpoint(5) );
+			reportLiveCommittedVersion = RequestStream< struct ReportRawCommittedVersionRequest>( waitFailure.getEndpoint().getAdjustedEndpoint(6) );
+		}
 	}
 
 	void initEndpoints() {
-		getCommitVersion.getEndpoint( TaskPriority::ProxyGetConsistentReadVersion );
-		tlogRejoin.getEndpoint( TaskPriority::MasterTLogRejoin );
+		std::vector<std::pair<FlowReceiver*, TaskPriority>> streams;
+		streams.push_back(waitFailure.getReceiver());
+		streams.push_back(tlogRejoin.getReceiver(TaskPriority::MasterTLogRejoin));
+		streams.push_back(changeCoordinators.getReceiver());
+		streams.push_back(getCommitVersion.getReceiver(TaskPriority::GetConsistentReadVersion));
+		streams.push_back(notifyBackupWorkerDone.getReceiver());
+		streams.push_back(getLiveCommittedVersion.getReceiver(TaskPriority::GetLiveCommittedVersion));
+		streams.push_back(reportLiveCommittedVersion.getReceiver(TaskPriority::ReportLiveCommittedVersion));
+		FlowTransport::transport().addEndpoints(streams);
 	}
 };
 
@@ -142,18 +163,55 @@ struct GetCommitVersionReply {
 
 struct GetCommitVersionRequest {
 	constexpr static FileIdentifier file_identifier = 16683181;
+	SpanID spanContext;
 	uint64_t requestNum;
 	uint64_t mostRecentProcessedRequestNum;
 	UID requestingProxy;
 	ReplyPromise<GetCommitVersionReply> reply;
 
 	GetCommitVersionRequest() { }
-	GetCommitVersionRequest(uint64_t requestNum, uint64_t mostRecentProcessedRequestNum, UID requestingProxy)
-		: requestNum(requestNum), mostRecentProcessedRequestNum(mostRecentProcessedRequestNum), requestingProxy(requestingProxy) {}
+	GetCommitVersionRequest(SpanID spanContext, uint64_t requestNum, uint64_t mostRecentProcessedRequestNum,
+	                        UID requestingProxy)
+	  : spanContext(spanContext), requestNum(requestNum), mostRecentProcessedRequestNum(mostRecentProcessedRequestNum),
+	    requestingProxy(requestingProxy) {}
 
 	template <class Ar>
 	void serialize(Ar& ar) {
-		serializer(ar, requestNum, mostRecentProcessedRequestNum, requestingProxy, reply);
+		serializer(ar, requestNum, mostRecentProcessedRequestNum, requestingProxy, reply, spanContext);
+	}
+};
+
+struct ReportRawCommittedVersionRequest {
+	constexpr static FileIdentifier file_identifier = 1853148;
+	Version version;
+	bool locked;
+	Optional<Value> metadataVersion;
+	Version minKnownCommittedVersion;
+
+	ReplyPromise<Void> reply;
+
+	ReportRawCommittedVersionRequest() : version(invalidVersion), locked(false), minKnownCommittedVersion(0) {}
+	ReportRawCommittedVersionRequest(Version version, bool locked, Optional<Value> metadataVersion, Version minKnownCommittedVersion)
+	  : version(version), locked(locked), metadataVersion(metadataVersion), minKnownCommittedVersion(minKnownCommittedVersion) {}
+
+	template <class Ar>
+	void serialize(Ar& ar) {
+		serializer(ar, version, locked, metadataVersion, minKnownCommittedVersion, reply);
+	}
+};
+
+struct BackupWorkerDoneRequest {
+	constexpr static FileIdentifier file_identifier = 8736351;
+	UID workerUID;
+	LogEpoch backupEpoch;
+	ReplyPromise<Void> reply;
+
+	BackupWorkerDoneRequest() : workerUID(), backupEpoch(-1) {}
+	BackupWorkerDoneRequest(UID id, LogEpoch epoch) : workerUID(id), backupEpoch(epoch) {}
+
+	template <class Ar>
+	void serialize(Ar& ar) {
+		serializer(ar, workerUID, backupEpoch, reply);
 	}
 };
 

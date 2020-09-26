@@ -133,7 +133,7 @@ struct union_like_traits : std::false_type {
 	static const index_t<i, alternatives>& get(const Member&, Context&);
 
 	template <int i, class Alternative, class Context>
-	static const void assign(Member&, const Alternative&, Context&);
+	static void assign(Member&, const Alternative&, Context&);
 
 	template <class Context>
 	static void done(Member&, Context&);
@@ -150,19 +150,19 @@ struct struct_like_traits : std::false_type {
 	static const index_t<i, types>& get(const Member&, Context&);
 
 	template <int i, class Context>
-	static const void assign(Member&, const index_t<i, types>&, Context&);
+	static void assign(Member&, const index_t<i, types>&, Context&);
 
 	template <class Context>
 	static void done(Member&, Context&);
 };
 
 template <class... Alternatives>
-struct union_like_traits<boost::variant<Alternatives...>> : std::true_type {
-	using Member = boost::variant<Alternatives...>;
+struct union_like_traits<std::variant<Alternatives...>> : std::true_type {
+	using Member = std::variant<Alternatives...>;
 	using alternatives = pack<Alternatives...>;
 	template <class Context>
 	static uint8_t index(const Member& variant, Context&) {
-		return variant.which();
+		return variant.index();
 	}
 	template <class Context>
 	static bool empty(const Member& variant, Context&) {
@@ -171,11 +171,11 @@ struct union_like_traits<boost::variant<Alternatives...>> : std::true_type {
 
 	template <int i, class Context>
 	static const index_t<i, alternatives>& get(const Member& variant, Context&) {
-		return boost::get<index_t<i, alternatives>>(variant);
+		return std::get<index_t<i, alternatives>>(variant);
 	}
 
 	template <size_t i, class Alternative, class Context>
-	static const void assign(Member& member, const Alternative& a, Context&) {
+	static void assign(Member& member, const Alternative& a, Context&) {
 		static_assert(std::is_same_v<index_t<i, alternatives>, Alternative>);
 		member = a;
 	}

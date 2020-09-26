@@ -26,10 +26,11 @@
 #include "fdbrpc/IAsyncFile.h"
 #include "fdbrpc/AsyncFileCached.actor.h"
 #include "fdbrpc/AsyncFileNonDurable.actor.h"
-#include "flow/Hash3.h"
+#include "flow/crc32c.h"
 #include "fdbrpc/TraceFileIO.h"
 #include "flow/FaultInjection.h"
 #include "flow/network.h"
+#include "flow/TLSConfig.actor.h"
 #include "fdbrpc/Net2FileSystem.h"
 #include "fdbrpc/Replication.h"
 #include "fdbrpc/ReplicationUtils.h"
@@ -82,21 +83,6 @@ void ISimulator::displayWorkers() const
 	}
 
 	return;
-}
-
-namespace std {
-template<>
-class hash<Endpoint> {
-public:
-	size_t operator()(const Endpoint &s) const
-	{
-		return hashlittle(&s, sizeof(s), 0);
-	}
-};
-}
-
-bool onlyBeforeSimulatorInit() {
-	return g_network->isSimulated() && g_simulator.getAllProcesses().empty();
 }
 
 const UID TOKEN_ENDPOINT_NOT_FOUND(-1, -1);
@@ -157,7 +143,7 @@ private:
 	std::map<IPAddress, double> clogSendUntil, clogRecvUntil;
 	std::map<std::pair<IPAddress, IPAddress>, double> clogPairUntil;
 	std::map<std::pair<IPAddress, IPAddress>, double> clogPairLatency;
-	double halfLatency() {
+	double halfLatency() const {
 		double a = deterministicRandom()->random01();
 		const double pFast = 0.999;
 		if (a <= pFast) {
@@ -199,6 +185,9 @@ struct Sim2Conn : IConnection, ReferenceCounted<Sim2Conn> {
 	virtual void addref() { ReferenceCounted<Sim2Conn>::addref(); }
 	virtual void delref() { ReferenceCounted<Sim2Conn>::delref(); }
 	virtual void close() { closedByCaller = true; closeInternal(); }
+
+	virtual Future<Void> acceptHandshake() { return delay(0.01*deterministicRandom()->random01()); }
+	virtual Future<Void> connectHandshake() { return delay(0.01*deterministicRandom()->random01()); }
 
 	virtual Future<Void> onWritable() { return whenWritable(this); }
 	virtual Future<Void> onReadable() { return whenReadable(this); }
@@ -256,7 +245,7 @@ struct Sim2Conn : IConnection, ReferenceCounted<Sim2Conn> {
 		int leftToSend = toSend;
 		for(auto p = buffer; p && leftToSend>0; p=p->next) {
 			int ts = std::min(leftToSend, p->bytes_written - p->bytes_sent);
-			peer->recvBuf.insert( peer->recvBuf.end(), p->data + p->bytes_sent, p->data + p->bytes_sent + ts );
+			peer->recvBuf.insert(peer->recvBuf.end(), p->data() + p->bytes_sent, p->data() + p->bytes_sent + ts);
 			leftToSend -= ts;
 		}
 		ASSERT( leftToSend == 0 );
@@ -266,8 +255,8 @@ struct Sim2Conn : IConnection, ReferenceCounted<Sim2Conn> {
 
 	// Returns the network address and port of the other end of the connection.  In the case of an incoming connection, this may not
 	// be an address we can connect to!
-	virtual NetworkAddress getPeerAddress() { return peerEndpoint; }
-	virtual UID getDebugID() { return dbgid; }
+	virtual NetworkAddress getPeerAddress() const override { return peerEndpoint; }
+	virtual UID getDebugID() const override { return dbgid; }
 
 	bool opened, closedByCaller;
 
@@ -293,6 +282,7 @@ private:
 	void closeInternal() {
 		if(peer) {
 			peer->peerClosed();
+			stopReceive = delay(1.0);
 		}
 		leakedConnectionTracker.cancel();
 		peer.clear();
@@ -488,31 +478,21 @@ public:
 	virtual void addref() { ReferenceCounted<SimpleFile>::addref(); }
 	virtual void delref() { ReferenceCounted<SimpleFile>::delref(); }
 
-	virtual int64_t debugFD() { return (int64_t)h; }
+	int64_t debugFD() const override { return (int64_t)h; }
 
-	virtual Future<int> read( void* data, int length, int64_t offset ) {
-		return read_impl( this, data, length, offset );
-	}
+	Future<int> read(void* data, int length, int64_t offset) override { return read_impl(this, data, length, offset); }
 
-	virtual Future<Void> write( void const* data, int length, int64_t offset ) {
+	Future<Void> write(void const* data, int length, int64_t offset) override {
 		return write_impl( this, StringRef((const uint8_t*)data, length), offset );
 	}
 
-	virtual Future<Void> truncate( int64_t size ) {
-		return truncate_impl( this, size );
-	}
+	Future<Void> truncate(int64_t size) override { return truncate_impl(this, size); }
 
-	virtual Future<Void> sync() {
-		return sync_impl( this );
-	}
+	Future<Void> sync() override { return sync_impl(this); }
 
-	virtual Future<int64_t> size() {
-		return size_impl( this );
-	}
+	Future<int64_t> size() const override { return size_impl(this); }
 
-	virtual std::string getFilename() {
-		return actualFilename;
-	}
+	std::string getFilename() const override { return actualFilename; }
 
 	~SimpleFile() {
 		_close( h );
@@ -567,8 +547,7 @@ private:
 		}
 
 		if (randLog) {
-			uint32_t a=0, b=0;
-			hashlittle2( data, read_bytes, &a, &b );
+			uint32_t a = crc32c_append( 0, (const uint8_t*)data, read_bytes );
 			fprintf( randLog, "SFR2 %s %s %s %d %d\n", self->dbgId.shortString().c_str(), self->filename.c_str(), opId.shortString().c_str(), read_bytes, a );
 		}
 
@@ -583,8 +562,7 @@ private:
 	ACTOR static Future<Void> write_impl( SimpleFile* self, StringRef data, int64_t offset ) {
 		state UID opId = deterministicRandom()->randomUniqueID();
 		if (randLog) {
-			uint32_t a=0, b=0;
-			hashlittle2( data.begin(), data.size(), &a, &b );
+			uint32_t a = crc32c_append( 0, data.begin(), data.size() );
 			fprintf( randLog, "SFW1 %s %s %s %d %d %" PRId64 "\n", self->dbgId.shortString().c_str(), self->filename.c_str(), opId.shortString().c_str(), a, data.size(), offset );
 		}
 
@@ -679,7 +657,7 @@ private:
 		return Void();
 	}
 
-	ACTOR static Future<int64_t> size_impl( SimpleFile* self ) {
+	ACTOR static Future<int64_t> size_impl(SimpleFile const* self) {
 		state UID opId = deterministicRandom()->randomUniqueID();
 		if (randLog)
 			fprintf(randLog, "SFS1 %s %s %s\n", self->dbgId.shortString().c_str(), self->filename.c_str(), opId.shortString().c_str());
@@ -724,7 +702,7 @@ struct Sim2Listener : IListener, ReferenceCounted<Sim2Listener> {
 		return popOne( nextConnection.getFuture() );
 	}
 
-	virtual NetworkAddress getListenAddress() { return address; }
+	virtual NetworkAddress getListenAddress() const override { return address; }
 
 private:
 	ISimulator::ProcessInfo* process;
@@ -755,7 +733,13 @@ class Sim2 : public ISimulator, public INetworkConnections {
 public:
 	// Implement INetwork interface
 	// Everything actually network related is delegated to the Sim2Net class; Sim2 is only concerned with simulating machines and time
-	virtual double now() { return time; }
+	virtual double now() const override { return time; }
+
+	// timer() can be up to 0.1 seconds ahead of now()
+	virtual double timer() {
+		timerTime += deterministicRandom()->random01()*(time+0.1-timerTime)/2.0;
+		return timerTime; 
+	}
 
 	virtual Future<class Void> delay( double seconds, TaskPriority taskID ) {
 		ASSERT(taskID >= TaskPriority::Min && taskID <= TaskPriority::Max);
@@ -766,7 +750,9 @@ public:
 		seconds = std::max(0.0, seconds);
 		Future<Void> f;
 
-		if(!currentProcess->rebooting && machine == currentProcess && !currentProcess->shutdownSignal.isSet() && FLOW_KNOBS->MAX_BUGGIFIED_DELAY > 0 && deterministicRandom()->random01() < 0.25) { //FIXME: why doesnt this work when we are changing machines?
+		if (!currentProcess->rebooting && machine == currentProcess && !currentProcess->shutdownSignal.isSet() &&
+		    FLOW_KNOBS->MAX_BUGGIFIED_DELAY > 0 &&
+		    deterministicRandom()->random01() < 0.25) { // FIXME: why doesnt this work when we are changing machines?
 			seconds += FLOW_KNOBS->MAX_BUGGIFIED_DELAY*pow(deterministicRandom()->random01(),1000.0);
 		}
 
@@ -799,15 +785,13 @@ public:
 		}
 		return yielded = BUGGIFY_WITH_PROB(0.01);
 	}
-	virtual TaskPriority getCurrentTask() {
-		return currentTaskID;
-	}
+	virtual TaskPriority getCurrentTask() const override { return currentTaskID; }
 	virtual void setCurrentTask(TaskPriority taskID ) {
 		currentTaskID = taskID;
 	}
 	// Sets the taskID/priority of the current task, without yielding
 	virtual Future<Reference<IConnection>> connect( NetworkAddress toAddr, std::string host ) {
-		ASSERT( !toAddr.isTLS() && host.empty());
+		ASSERT( host.empty());
 		if (!addressMap.count( toAddr )) {
 			return waitForProcessAndConnect( toAddr, this );
 		}
@@ -825,7 +809,7 @@ public:
 		} else {
 			localIp = IPAddress(getCurrentProcess()->address.ip.toV4() + deterministicRandom()->randomInt(0, 256));
 		}
-		peerc->connect(myc, NetworkAddress(localIp, deterministicRandom()->randomInt(40000, 60000)));
+		peerc->connect(myc, NetworkAddress(localIp, deterministicRandom()->randomInt(40000, 60000), false, toAddr.isTLS()));
 
 		((Sim2Listener*)peerp->getListener(toAddr).getPtr())->incomingConnection( 0.5*deterministicRandom()->random01(), Reference<IConnection>(peerc) );
 		return onConnect( ::delay(0.5*deterministicRandom()->random01()), myc );
@@ -835,15 +819,17 @@ public:
 	}
 	ACTOR static Future<Reference<IConnection>> onConnect( Future<Void> ready, Reference<Sim2Conn> conn ) {
 		wait(ready);
-		if (conn->isPeerGone() && deterministicRandom()->random01()<0.5) {
+		if (conn->isPeerGone()) {
 			conn.clear();
+			if(FLOW_KNOBS->SIM_CONNECT_ERROR_MODE == 1 || (FLOW_KNOBS->SIM_CONNECT_ERROR_MODE == 2 && deterministicRandom()->random01() > 0.5)) {
+				throw connection_failed();
+			}
 			wait(Never());
 		}
 		conn->opened = true;
 		return conn;
 	}
 	virtual Reference<IListener> listen( NetworkAddress localAddr ) {
-		ASSERT( !localAddr.isTLS() );
 		Reference<IListener> listener( getCurrentProcess()->getListener(localAddr) );
 		ASSERT(listener);
 		return listener;
@@ -859,8 +845,21 @@ public:
 			}
 		}
 	}
+	virtual const TLSConfig& getTLSConfig() const override {
+		static TLSConfig emptyConfig;
+		return emptyConfig;
+	}
 
-	virtual void stop() { isStopped = true; }
+	virtual bool checkRunnable() {
+		return net2->checkRunnable();
+	}
+
+	virtual void stop() {
+		isStopped = true;
+	}
+	virtual void addStopCallback( std::function<void()> fn ) {
+		stopCallbacks.emplace_back(std::move(fn));
+	}
 	virtual bool isSimulated() const { return true; }
 
 	struct SimThreadArgs {
@@ -925,7 +924,7 @@ public:
 		if(free == 0)
 			TraceEvent(SevWarnAlways, "Sim2NoFreeSpace").detail("TotalSpace", diskSpace.totalSpace).detail("BaseFreeSpace", diskSpace.baseFreeSpace).detail("TotalFileSize", totalFileSize).detail("NumFiles", numFiles);
 	}
-	virtual bool isAddressOnThisHost( NetworkAddress const& addr ) {
+	virtual bool isAddressOnThisHost(NetworkAddress const& addr) const override {
 		return addr.ip == getCurrentProcess()->address.ip;
 	}
 
@@ -984,6 +983,9 @@ public:
 		}
 		self->currentProcess = callingMachine;
 		self->net2->stop();
+		for ( auto& fn : self->stopCallbacks ) {
+			fn();
+		}
 		return Void();
 	}
 
@@ -992,7 +994,7 @@ public:
 		Future<Void> loopFuture = runLoop(this);
 		net2->run();
 	}
-	virtual ProcessInfo* newProcess(const char* name, IPAddress ip, uint16_t port, uint16_t listenPerProcess,
+	virtual ProcessInfo* newProcess(const char* name, IPAddress ip, uint16_t port, bool sslEnabled, uint16_t listenPerProcess,
 	                                LocalityData locality, ProcessClass startingClass, const char* dataFolder,
 	                                const char* coordinationFolder) {
 		ASSERT( locality.machineId().present() );
@@ -1021,21 +1023,21 @@ public:
 		}
 
 		NetworkAddressList addresses;
-		addresses.address = NetworkAddress(ip, port, true, false);
-		if(listenPerProcess == 2) {
+		addresses.address = NetworkAddress(ip, port, true, sslEnabled);
+		if (listenPerProcess == 2) { // listenPerProcess is only 1 or 2
 			addresses.secondaryAddress = NetworkAddress(ip, port+1, true, false);
 		}
 
 		ProcessInfo* m = new ProcessInfo(name, locality, startingClass, addresses, this, dataFolder, coordinationFolder);
 		for (int processPort = port; processPort < port + listenPerProcess; ++processPort) {
-			NetworkAddress address(ip, processPort, true, false); // SOMEDAY see above about becoming SSL!
+			NetworkAddress address(ip, processPort, true, sslEnabled && processPort == port);
 			m->listenerMap[address] = Reference<IListener>( new Sim2Listener(m, address) );
 			addressMap[address] = m;
 		}
 		m->machine = &machine;
 		machine.processes.push_back(m);
 		currentlyRebootingProcesses.erase(addresses.address);
-		m->excluded = g_simulator.isExcluded(addresses.address);
+		m->excluded = g_simulator.isExcluded(NetworkAddress(ip, port, true, false));
 		m->cleared = g_simulator.isCleared(addresses.address);
 
 		m->setGlobal(enTDMetrics, (flowGlobalType) &m->tdmetrics);
@@ -1060,7 +1062,7 @@ public:
 				}
 			}
 		}
-		return canKillProcesses(processesLeft, processesDead, KillInstantly, NULL);
+		return canKillProcesses(processesLeft, processesDead, KillInstantly, nullptr);
 	}
 
 	virtual bool datacenterDead(Optional<Standalone<StringRef>> dcId) const
@@ -1205,21 +1207,40 @@ public:
 			if (tooManyDead) {
 				newKt = Reboot;
 				canSurvive = false;
-				TraceEvent("KillChanged").detail("KillType", kt).detail("NewKillType", newKt).detail("TLogPolicy", tLogPolicy->info()).detail("Reason", "tLogPolicy validates against dead processes.");
+				TraceEvent("KillChanged")
+				    .detail("KillType", kt)
+				    .detail("NewKillType", newKt)
+				    .detail("TLogPolicy", tLogPolicy->info())
+				    .detail("Reason", "Too many dead processes that cannot satisfy tLogPolicy.");
 			}
 			// Reboot and Delete if remaining machines do NOT fulfill policies
 			else if ((kt < RebootAndDelete) && notEnoughLeft) {
 				newKt = RebootAndDelete;
 				canSurvive = false;
-				TraceEvent("KillChanged").detail("KillType", kt).detail("NewKillType", newKt).detail("TLogPolicy", tLogPolicy->info()).detail("Reason", "tLogPolicy does not validates against remaining processes.");
+				TraceEvent("KillChanged")
+				    .detail("KillType", kt)
+				    .detail("NewKillType", newKt)
+				    .detail("TLogPolicy", tLogPolicy->info())
+				    .detail("Reason", "Not enough tLog left to satisfy tLogPolicy.");
 			}
 			else if ((kt < RebootAndDelete) && (nQuorum > uniqueMachines.size())) {
 				newKt = RebootAndDelete;
 				canSurvive = false;
-				TraceEvent("KillChanged").detail("KillType", kt).detail("NewKillType", newKt).detail("StoragePolicy", storagePolicy->info()).detail("Quorum", nQuorum).detail("Machines", uniqueMachines.size()).detail("Reason", "Not enough unique machines to perform auto configuration of coordinators.");
+				TraceEvent("KillChanged")
+				    .detail("KillType", kt)
+				    .detail("NewKillType", newKt)
+				    .detail("StoragePolicy", storagePolicy->info())
+				    .detail("Quorum", nQuorum)
+				    .detail("Machines", uniqueMachines.size())
+				    .detail("Reason", "Not enough unique machines to perform auto configuration of coordinators.");
 			}
 			else {
-				TraceEvent("CanSurviveKills").detail("KillType", kt).detail("TLogPolicy", tLogPolicy->info()).detail("StoragePolicy", storagePolicy->info()).detail("Quorum", nQuorum).detail("Machines", uniqueMachines.size());
+				TraceEvent("CanSurviveKills")
+				    .detail("KillType", kt)
+				    .detail("TLogPolicy", tLogPolicy->info())
+				    .detail("StoragePolicy", storagePolicy->info())
+				    .detail("Quorum", nQuorum)
+				    .detail("Machines", uniqueMachines.size());
 			}
 		}
 		if (newKillType) *newKillType = newKt;
@@ -1243,12 +1264,26 @@ public:
 		TEST( kt == InjectFaults ); // Simulated machine was killed with faults
 
 		if (kt == KillInstantly) {
-			TraceEvent(SevWarn, "FailMachine").detail("Name", machine->name).detail("Address", machine->address).detail("ZoneId", machine->locality.zoneId()).detail("Process", machine->toString()).detail("Rebooting", machine->rebooting).detail("Protected", protectedAddresses.count(machine->address)).backtrace();
+			TraceEvent(SevWarn, "FailMachine")
+			    .detail("Name", machine->name)
+			    .detail("Address", machine->address)
+			    .detail("ZoneId", machine->locality.zoneId())
+			    .detail("Process", machine->toString())
+			    .detail("Rebooting", machine->rebooting)
+			    .detail("Protected", protectedAddresses.count(machine->address))
+			    .backtrace();
 			// This will remove all the "tracked" messages that came from the machine being killed
 			latestEventCache.clear();
 			machine->failed = true;
 		} else if (kt == InjectFaults) {
-			TraceEvent(SevWarn, "FaultMachine").detail("Name", machine->name).detail("Address", machine->address).detail("ZoneId", machine->locality.zoneId()).detail("Process", machine->toString()).detail("Rebooting", machine->rebooting).detail("Protected", protectedAddresses.count(machine->address)).backtrace();
+			TraceEvent(SevWarn, "FaultMachine")
+			    .detail("Name", machine->name)
+			    .detail("Address", machine->address)
+			    .detail("ZoneId", machine->locality.zoneId())
+			    .detail("Process", machine->toString())
+			    .detail("Rebooting", machine->rebooting)
+			    .detail("Protected", protectedAddresses.count(machine->address))
+			    .backtrace();
 			should_inject_fault = simulator_should_inject_fault;
 			machine->fault_injection_r = deterministicRandom()->randomUniqueID().first();
 			machine->fault_injection_p1 = 0.1;
@@ -1283,7 +1318,7 @@ public:
 		}
 	}
 	virtual void killProcess( ProcessInfo* machine, KillType kt ) {
-		TraceEvent("AttemptingKillProcess");
+		TraceEvent("AttemptingKillProcess").detail("ProcessInfo", machine->toString());
 		if (kt < RebootAndDelete ) {
 			killProcess_internal( machine, kt );
 		}
@@ -1561,9 +1596,10 @@ public:
 		return processes;
 	}
 	virtual ProcessInfo* getProcessByAddress( NetworkAddress const& address ) {
-		NetworkAddress normalizedAddress(address.ip, address.port, true, false);
+		NetworkAddress normalizedAddress(address.ip, address.port, true, address.isTLS());
 		ASSERT( addressMap.count( normalizedAddress ) );
-		return addressMap[ normalizedAddress ];
+		// NOTE: addressMap[normalizedAddress]->address may not equal to normalizedAddress
+		return addressMap[normalizedAddress];
 	}
 
 	virtual MachineInfo* getMachineByNetworkAddress(NetworkAddress const& address) {
@@ -1585,10 +1621,11 @@ public:
 		machines.erase(machineId);
 	}
 
-	Sim2() : time(0.0), taskCount(0), yielded(false), yield_limit(0), currentTaskID(TaskPriority::Zero) {
-		// Not letting currentProcess be NULL eliminates some annoying special cases
+	Sim2() : time(0.0), timerTime(0.0), taskCount(0), yielded(false), yield_limit(0), currentTaskID(TaskPriority::Zero) {
+		// Not letting currentProcess be nullptr eliminates some annoying special cases
 		currentProcess = new ProcessInfo("NoMachine", LocalityData(Optional<Standalone<StringRef>>(), StringRef(), StringRef(), StringRef()), ProcessClass(), {NetworkAddress()}, this, "", "");
-		g_network = net2 = newNet2(false, true);
+		g_network = net2 = newNet2(TLSConfig(), false, true);
+		g_network->addStopCallback( Net2FileSystem::stop );
 		Net2FileSystem::newFileSystem();
 		check_yield(TaskPriority::Zero);
 	}
@@ -1602,10 +1639,18 @@ public:
 		Promise<Void> action;
 		Task( double time, TaskPriority taskID, uint64_t stable, ProcessInfo* machine, Promise<Void>&& action ) : time(time), taskID(taskID), stable(stable), machine(machine), action(std::move(action)) {}
 		Task( double time, TaskPriority taskID, uint64_t stable, ProcessInfo* machine, Future<Void>& future ) : time(time), taskID(taskID), stable(stable), machine(machine) { future = action.getFuture(); }
-		Task(Task&& rhs) BOOST_NOEXCEPT : time(rhs.time), taskID(rhs.taskID), stable(rhs.stable), machine(rhs.machine), action(std::move(rhs.action)) {}
+		Task(Task&& rhs) noexcept
+		  : time(rhs.time), taskID(rhs.taskID), stable(rhs.stable), machine(rhs.machine),
+		    action(std::move(rhs.action)) {}
 		void operator= ( Task const& rhs ) { taskID = rhs.taskID; time = rhs.time; stable = rhs.stable; machine = rhs.machine; action = rhs.action; }
 		Task( Task const& rhs ) : taskID(rhs.taskID), time(rhs.time), stable(rhs.stable), machine(rhs.machine), action(rhs.action) {}
-		void operator= (Task&& rhs) BOOST_NOEXCEPT { time = rhs.time; taskID = rhs.taskID; stable = rhs.stable; machine = rhs.machine; action = std::move(rhs.action); }
+		void operator=(Task&& rhs) noexcept {
+			time = rhs.time;
+			taskID = rhs.taskID;
+			stable = rhs.stable;
+			machine = rhs.machine;
+			action = std::move(rhs.action);
+		}
 
 		bool operator < (Task const& rhs) const {
 			// Ordering is reversed for priority_queue
@@ -1621,27 +1666,17 @@ public:
 		else {
 			mutex.enter();
 			this->time = t.time;
+			this->timerTime = std::max(this->timerTime, this->time);
 			mutex.leave();
 
 			this->currentProcess = t.machine;
 			try {
-				//auto before = getCPUTicks();
 				t.action.send(Void());
 				ASSERT( this->currentProcess == t.machine );
-				/*auto elapsed = getCPUTicks() - before;
-				currentProcess->cpuTicks += elapsed;
-				if (deterministicRandom()->random01() < 0.01){
-					TraceEvent("TaskDuration").detail("CpuTicks", currentProcess->cpuTicks);
-					currentProcess->cpuTicks = 0;
-				}*/
 			} catch (Error& e) {
 				TraceEvent(SevError, "UnhandledSimulationEventError").error(e, true);
 				killProcess(t.machine, KillInstantly);
 			}
-
-			//if( this->time > 45.522817 ) {
-			//	printf("foo\n");
-			//}
 
 			if (randLog)
 				fprintf( randLog, "T %f %d %s %" PRId64 "\n", this->time, int(deterministicRandom()->peek() % 10000), t.machine ? t.machine->name : "none", t.stable);
@@ -1673,6 +1708,7 @@ public:
 	//time is guarded by ISimulator::mutex. It is not necessary to guard reads on the main thread because
 	//time should only be modified from the main thread.
 	double time;
+	double timerTime;
 	TaskPriority currentTaskID;
 
 	//taskCount is guarded by ISimulator::mutex
@@ -1684,6 +1720,8 @@ public:
 
 	//tasks is guarded by ISimulator::mutex
 	std::priority_queue<Task, std::vector<Task>> tasks;
+
+	std::vector<std::function<void()>> stopCallbacks;
 
 	//Sim2Net network;
 	INetwork *net2;
@@ -1703,7 +1741,16 @@ void startNewSimulator() {
 }
 
 ACTOR void doReboot( ISimulator::ProcessInfo *p, ISimulator::KillType kt ) {
-	TraceEvent("RebootingProcessAttempt").detail("ZoneId", p->locality.zoneId()).detail("KillType", kt).detail("Process", p->toString()).detail("StartingClass", p->startingClass.toString()).detail("Failed", p->failed).detail("Excluded", p->excluded).detail("Cleared", p->cleared).detail("Rebooting", p->rebooting).detail("TaskPriorityDefaultDelay", TaskPriority::DefaultDelay);
+	TraceEvent("RebootingProcessAttempt")
+	    .detail("ZoneId", p->locality.zoneId())
+	    .detail("KillType", kt)
+	    .detail("Process", p->toString())
+	    .detail("StartingClass", p->startingClass.toString())
+	    .detail("Failed", p->failed)
+	    .detail("Excluded", p->excluded)
+	    .detail("Cleared", p->cleared)
+	    .detail("Rebooting", p->rebooting)
+	    .detail("TaskPriorityDefaultDelay", TaskPriority::DefaultDelay);
 
 	wait( g_sim2.delay( 0, TaskPriority::DefaultDelay, p ) ); // Switch to the machine in question
 
@@ -1715,9 +1762,18 @@ ACTOR void doReboot( ISimulator::ProcessInfo *p, ISimulator::KillType kt ) {
 		TEST( kt == ISimulator::RebootAndDelete ); // Simulated machine rebooted with data and coordination state deletion
 		TEST( kt == ISimulator::RebootProcessAndDelete ); // Simulated process rebooted with data and coordination state deletion
 
-		if( p->rebooting )
+		if( p->rebooting || !p->isReliable() )
 			return;
-		TraceEvent("RebootingProcess").detail("KillType", kt).detail("Address", p->address).detail("ZoneId", p->locality.zoneId()).detail("DataHall", p->locality.dataHallId()).detail("Locality", p->locality.toString()).detail("Failed", p->failed).detail("Excluded", p->excluded).detail("Cleared", p->cleared).backtrace();
+		TraceEvent("RebootingProcess")
+		    .detail("KillType", kt)
+		    .detail("Address", p->address)
+		    .detail("ZoneId", p->locality.zoneId())
+		    .detail("DataHall", p->locality.dataHallId())
+		    .detail("Locality", p->locality.toString())
+		    .detail("Failed", p->failed)
+		    .detail("Excluded", p->excluded)
+		    .detail("Cleared", p->cleared)
+		    .backtrace();
 		p->rebooting = true;
 		if ((kt == ISimulator::RebootAndDelete) || (kt == ISimulator::RebootProcessAndDelete)) {
 			p->cleared = true;
@@ -1757,12 +1813,12 @@ Future<Void> waitUntilDiskReady( Reference<DiskParameters> diskParameters, int64
 
 int sf_open( const char* filename, int flags, int convFlags, int mode ) {
 	HANDLE wh = CreateFile( filename, GENERIC_READ | ((flags&IAsyncFile::OPEN_READWRITE) ? GENERIC_WRITE : 0),
-		FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE, NULL,
+		FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE, nullptr,
 		(flags&IAsyncFile::OPEN_EXCLUSIVE) ? CREATE_NEW :
 			(flags&IAsyncFile::OPEN_CREATE) ? OPEN_ALWAYS :
 			OPEN_EXISTING,
 		FILE_ATTRIBUTE_NORMAL,
-		NULL );
+		nullptr );
 	int h = -1;
 	if (wh != INVALID_HANDLE_VALUE) h = _open_osfhandle( (intptr_t)wh, convFlags );
 	else errno = GetLastError() == ERROR_FILE_NOT_FOUND ? ENOENT : EFAULT;
@@ -1794,7 +1850,8 @@ Future< Reference<class IAsyncFile> > Sim2FileSystem::open( std::string filename
 					return f;
 				}
 			}
-			//Simulated disk parameters are shared by the AsyncFileNonDurable and the underlying SimpleFile.  This way, they can both keep up with the time to start the next operation
+			// Simulated disk parameters are shared by the AsyncFileNonDurable and the underlying SimpleFile.
+			// This way, they can both keep up with the time to start the next operation
 			Reference<DiskParameters> diskParameters(new DiskParameters(FLOW_KNOBS->SIM_DISK_IOPS, FLOW_KNOBS->SIM_DISK_BANDWIDTH));
 			machineCache[actualFilename] = AsyncFileNonDurable::open(filename, actualFilename, SimpleFile::open(filename, flags, mode, diskParameters, false), diskParameters);
 		}

@@ -88,6 +88,8 @@ cluster.messages                      unreachable_ratekeeper_worker         Unab
 cluster.messages                      unreachable_processes                 The cluster has some unreachable processes.
 cluster.messages                      unreadable_configuration              Unable to read database configuration.
 cluster.messages                      layer_status_incomplete               Some or all of the layers subdocument could not be read.
+cluster.messages                      primary_dc_missing                    Unable to determine primary datacenter.
+cluster.messages                      fetch_primary_dc_timeout              Fetching primary DC timed out.
 cluster.processes.<process>.messages  file_open_error                       Unable to open ‘<file>’ (<os_error>).
 cluster.processes.<process>.messages  incorrect_cluster_file_contents       Cluster file contents do not match current cluster connection string. Verify cluster file is writable and has not been overwritten externally.
 cluster.processes.<process>.messages  io_error                              <error> occured in <subsystem>
@@ -129,4 +131,14 @@ min_free_space_ratio                Running out of space (approaching 5% limit).
 log_server_min_free_space           Log server running out of space (approaching 100MB limit).
 log_server_min_free_space_ratio     Log server running out of space (approaching 5% limit).
 storage_server_durability_lag       Storage server durable version falling behind.
+=================================== ====================================================
+
+The JSON path ``cluster.qos.throttled_tags``, when it exists, is an Object containing ``"auto"`` , ``"manual"`` and ``"recommended"``.  The possible fields for those object are in the following table:
+
+=================================== ====================================================
+Name                                Description
+=================================== ====================================================
+count                               How many tags are throttled
+busy_read                           How many tags are throttled because of busy read
+busy_write                          How many tags are throttled because of busy write
 =================================== ====================================================

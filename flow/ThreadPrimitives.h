@@ -22,10 +22,13 @@
 #define FLOW_THREADPRIMITIVES_H
 #pragma once
 
+#include <atomic>
+#include <array>
+
 #include "flow/Error.h"
 #include "flow/Trace.h"
 
-#ifdef __linux__
+#if defined(__linux__) || defined(__FreeBSD__)
 #include <semaphore.h>
 #endif
 
@@ -42,10 +45,14 @@
 #include <drd.h>
 #endif
 
-class ThreadSpinLock {
+// TODO: We should make this dependent on the CPU. Maybe cmake
+// can set this variable properly?
+constexpr size_t CACHE_LINE_SIZE = 64;
+
+class alignas(CACHE_LINE_SIZE) ThreadSpinLock {
 public:
 // #ifdef _WIN32
-	ThreadSpinLock(bool initiallyLocked=false) : isLocked(initiallyLocked) {
+	ThreadSpinLock() {
 #if VALGRIND
 		ANNOTATE_RWLOCK_CREATE(this);
 #endif
@@ -56,31 +63,34 @@ public:
 #endif
 	}
 	void enter() {
-		while (interlockedCompareExchange(&isLocked, 1, 0) == 1)
+		while (isLocked.test_and_set(std::memory_order_acquire))
+#ifndef __aarch64__
 			_mm_pause();
+#else
+			; /* spin */
+#endif
 #if VALGRIND
 		ANNOTATE_RWLOCK_ACQUIRED(this, true);
 #endif
 	}
 	void leave() {
-#if defined(__linux__)
-	__sync_synchronize();
-#endif
-		isLocked = 0;
-#if defined(__linux__)
-	__sync_synchronize();
-#endif
+		isLocked.clear(std::memory_order_release);
 #if VALGRIND
 		ANNOTATE_RWLOCK_RELEASED(this, true);
 #endif
 	}
 	void assertNotEntered() {
-		ASSERT( !isLocked );
+		ASSERT(!isLocked.test_and_set(std::memory_order_acquire));
+		isLocked.clear(std::memory_order_release);
 	}
+
 private:
 	ThreadSpinLock(const ThreadSpinLock&);
 	void operator=(const ThreadSpinLock&);
-	volatile int32_t isLocked;
+	std::atomic_flag isLocked = ATOMIC_FLAG_INIT;
+	// We want a spin lock to occupy a cache line in order to
+	// prevent false sharing.
+	std::array<uint8_t, CACHE_LINE_SIZE - sizeof(isLocked)> padding;
 };
 
 class ThreadSpinLockHolder {
@@ -115,7 +125,7 @@ public:
 private:
 #ifdef _WIN32
 	void* ev;
-#elif defined(__linux__)
+#elif defined(__linux__) || defined(__FreeBSD__)
 	sem_t sem;
 #elif defined(__APPLE__)
 	mach_port_t self;

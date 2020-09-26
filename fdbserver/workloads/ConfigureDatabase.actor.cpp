@@ -27,13 +27,14 @@
 #include "flow/actorcompiler.h"  // This must be the last #include.
 
 // "ssd" is an alias to the preferred type which skews the random distribution toward it but that's okay.
-static const char* storeTypes[] = { "ssd", "ssd-1", "ssd-2", "memory", "memory-1", "memory-2" };
+static const char* storeTypes[] = { "ssd", "ssd-1", "ssd-2", "memory", "memory-1", "memory-2", "memory-radixtree-beta" };
 static const char* logTypes[] = {
 	"log_engine:=1", "log_engine:=2",
 	"log_spill:=1", "log_spill:=2",
 	"log_version:=2", "log_version:=3", "log_version:=4"
 };
 static const char* redundancies[] = { "single", "double", "triple" };
+static const char* backupTypes[] = { "backup_worker_enabled:=0", "backup_worker_enabled:=1" };
 
 std::string generateRegions() {
 	std::string result;
@@ -75,12 +76,14 @@ std::string generateRegions() {
 		primarySatelliteObj["id"] = "2";
 		primarySatelliteObj["priority"] = 1;
 		primarySatelliteObj["satellite"] = 1;
+		if (deterministicRandom()->random01() < 0.25) primarySatelliteObj["satellite_logs"] = deterministicRandom()->randomInt(1,7);
 		primaryDcArr.push_back(primarySatelliteObj);
 
 		StatusObject remoteSatelliteObj;
 		remoteSatelliteObj["id"] = "3";
 		remoteSatelliteObj["priority"] = 1;
 		remoteSatelliteObj["satellite"] = 1;
+		if (deterministicRandom()->random01() < 0.25) remoteSatelliteObj["satellite_logs"] = deterministicRandom()->randomInt(1,7);
 		remoteDcArr.push_back(remoteSatelliteObj);
 
 		if(g_simulator.physicalDatacenters > 5 && deterministicRandom()->random01() < 0.5) {
@@ -88,12 +91,14 @@ std::string generateRegions() {
 			primarySatelliteObjB["id"] = "4";
 			primarySatelliteObjB["priority"] = 1;
 			primarySatelliteObjB["satellite"] = 1;
+			if (deterministicRandom()->random01() < 0.25) primarySatelliteObjB["satellite_logs"] = deterministicRandom()->randomInt(1,7);
 			primaryDcArr.push_back(primarySatelliteObjB);
 
 			StatusObject remoteSatelliteObjB;
 			remoteSatelliteObjB["id"] = "5";
 			remoteSatelliteObjB["priority"] = 1;
 			remoteSatelliteObjB["satellite"] = 1;
+			if (deterministicRandom()->random01() < 0.25) remoteSatelliteObjB["satellite_logs"] = deterministicRandom()->randomInt(1,7);
 			remoteDcArr.push_back(remoteSatelliteObjB);
 
 			int satellite_replication_type = deterministicRandom()->randomInt(0,3);
@@ -146,11 +151,8 @@ std::string generateRegions() {
 			}
 		}
 
-		if (deterministicRandom()->random01() < 0.25) {
-			int logs = deterministicRandom()->randomInt(1,7);
-			primaryObj["satellite_logs"] = logs;
-			remoteObj["satellite_logs"] = logs;
-		}
+		if (deterministicRandom()->random01() < 0.25) primaryObj["satellite_logs"] = deterministicRandom()->randomInt(1,7);
+		if (deterministicRandom()->random01() < 0.25) remoteObj["satellite_logs"] = deterministicRandom()->randomInt(1,7);
 
 		int remote_replication_type = deterministicRandom()->randomInt(0, 4);
 		switch (remote_replication_type) {
@@ -266,12 +268,11 @@ struct ConfigureDatabaseWorkload : TestWorkload {
 
 	ACTOR Future<Void> singleDB( ConfigureDatabaseWorkload *self, Database cx ) {
 		state Transaction tr;
-		state int i;
 		loop {
 			if(g_simulator.speedUpSimulation) {
 				return Void();
 			}
-			state int randomChoice = deterministicRandom()->randomInt(0, 7);
+			state int randomChoice = deterministicRandom()->randomInt(0, 8);
 			if( randomChoice == 0 ) {
 				wait( success(
 						runRYWTransaction(cx, [=](Reference<ReadYourWritesTransaction> tr) -> Future<Optional<Value>>
@@ -301,7 +302,15 @@ struct ConfigureDatabaseWorkload : TestWorkload {
 				config += generateRegions();
 
 				if (deterministicRandom()->random01() < 0.5) config += " logs=" + format("%d", randomRoleNumber());
-				if (deterministicRandom()->random01() < 0.5) config += " proxies=" + format("%d", randomRoleNumber());
+
+				if (deterministicRandom()->random01() < 0.2) {
+					config += " proxies=" + format("%d", deterministicRandom()->randomInt(2, 5));
+				} else {
+					if (deterministicRandom()->random01() < 0.5)
+						config += " commit_proxies=" + format("%d", randomRoleNumber());
+					if (deterministicRandom()->random01() < 0.5)
+						config += " grv_proxies=" + format("%d", randomRoleNumber());
+				}
 				if (deterministicRandom()->random01() < 0.5) config += " resolvers=" + format("%d", randomRoleNumber());
 
 				wait(success( IssueConfigurationChange( cx, config, false ) ));
@@ -322,8 +331,11 @@ struct ConfigureDatabaseWorkload : TestWorkload {
 			else if ( randomChoice == 6 ) {
 				// Some configurations will be invalid, and that's fine.
 				wait(success( IssueConfigurationChange( cx, logTypes[deterministicRandom()->randomInt( 0, sizeof(logTypes)/sizeof(logTypes[0]))], false ) ));
-			}
-			else {
+			} else if (randomChoice == 7) {
+				wait(success(IssueConfigurationChange(
+				    cx, backupTypes[deterministicRandom()->randomInt(0, sizeof(backupTypes) / sizeof(backupTypes[0]))],
+				    false)));
+			} else {
 				ASSERT(false);
 			}
 		}

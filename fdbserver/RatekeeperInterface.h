@@ -30,6 +30,7 @@ struct RatekeeperInterface {
 	RequestStream<ReplyPromise<Void>> waitFailure;
 	RequestStream<struct GetRateInfoRequest> getRateInfo;
 	RequestStream<struct HaltRatekeeperRequest> haltRatekeeper;
+	RequestStream<struct ReportCommitCostEstimationRequest> reportCommitCostEstimation;
 	struct LocalityData locality;
 	UID myId;
 
@@ -48,7 +49,60 @@ struct RatekeeperInterface {
 
 	template <class Archive>
 	void serialize(Archive& ar) {
-		serializer(ar, waitFailure, getRateInfo, haltRatekeeper, locality, myId);
+		serializer(ar, waitFailure, getRateInfo, haltRatekeeper, reportCommitCostEstimation, locality, myId);
+	}
+};
+
+struct ClientTagThrottleLimits {
+	double tpsRate;
+	double expiration;
+
+	ClientTagThrottleLimits() : tpsRate(0), expiration(0) {}
+	ClientTagThrottleLimits(double tpsRate, double expiration) : tpsRate(tpsRate), expiration(expiration) {}
+
+	template <class Archive>
+	void serialize(Archive& ar) {
+		// Convert expiration time to a duration to avoid clock differences
+		double duration = 0;
+		if(!ar.isDeserializing) {
+			duration = expiration - now();
+		}
+
+		serializer(ar, tpsRate, duration);
+
+		if(ar.isDeserializing) {
+			expiration = now() + duration;
+		}
+	}
+};
+
+struct TransactionCommitCostEstimation {
+	int opsSum = 0;
+	uint64_t costSum = 0;
+
+	uint64_t getCostSum() const { return costSum; }
+	int getOpsSum() const { return opsSum; }
+
+	template <class Ar>
+	void serialize(Ar& ar) {
+		serializer(ar, opsSum, costSum);
+	}
+
+	TransactionCommitCostEstimation& operator+=(const TransactionCommitCostEstimation& other) {
+		opsSum += other.opsSum;
+		costSum += other.costSum;
+		return *this;
+	}
+};
+
+struct ClientTrCommitCostEstimation {
+	int opsCount = 0;
+	uint64_t writeCosts = 0;
+	std::deque<std::pair<int, uint64_t>> clearIdxCosts;
+	uint32_t expensiveCostEstCount = 0;
+	template <class Ar>
+	void serialize(Ar& ar) {
+		serializer(ar, opsCount, writeCosts, clearIdxCosts, expensiveCostEstCount);
 	}
 };
 
@@ -59,9 +113,11 @@ struct GetRateInfoReply {
 	double leaseDuration;
 	HealthMetrics healthMetrics;
 
+	Optional<PrioritizedTransactionTagMap<ClientTagThrottleLimits>> throttledTags;
+
 	template <class Ar>
 	void serialize(Ar& ar) {
-		serializer(ar, transactionRate, batchTransactionRate, leaseDuration, healthMetrics);
+		serializer(ar, transactionRate, batchTransactionRate, leaseDuration, healthMetrics, throttledTags);
 	}
 };
 
@@ -70,16 +126,22 @@ struct GetRateInfoRequest {
 	UID requesterID;
 	int64_t totalReleasedTransactions;
 	int64_t batchReleasedTransactions;
+
+	TransactionTagMap<uint64_t> throttledTagCounts;
 	bool detailed;
 	ReplyPromise<struct GetRateInfoReply> reply;
 
 	GetRateInfoRequest() {}
-	GetRateInfoRequest(UID const& requesterID, int64_t totalReleasedTransactions, int64_t batchReleasedTransactions, bool detailed)
-		: requesterID(requesterID), totalReleasedTransactions(totalReleasedTransactions), batchReleasedTransactions(batchReleasedTransactions), detailed(detailed) {}
+	GetRateInfoRequest(UID const& requesterID, int64_t totalReleasedTransactions, int64_t batchReleasedTransactions,
+	                   TransactionTagMap<uint64_t> throttledTagCounts, bool detailed)
+	  : requesterID(requesterID), totalReleasedTransactions(totalReleasedTransactions),
+	    batchReleasedTransactions(batchReleasedTransactions), throttledTagCounts(throttledTagCounts),
+	    detailed(detailed) {}
 
 	template <class Ar>
 	void serialize(Ar& ar) {
-		serializer(ar, requesterID, totalReleasedTransactions, batchReleasedTransactions, detailed, reply);
+		serializer(ar, requesterID, totalReleasedTransactions, batchReleasedTransactions, throttledTagCounts, detailed,
+		           reply);
 	}
 };
 
@@ -94,6 +156,21 @@ struct HaltRatekeeperRequest {
 	template<class Ar>
 	void serialize(Ar& ar) {
 		serializer(ar, requesterID, reply);
+	}
+};
+
+struct ReportCommitCostEstimationRequest {
+	constexpr static FileIdentifier file_identifier = 8314904;
+	UIDTransactionTagMap<TransactionCommitCostEstimation> ssTrTagCommitCost;
+	ReplyPromise<Void> reply;
+
+	ReportCommitCostEstimationRequest() {}
+	ReportCommitCostEstimationRequest(UIDTransactionTagMap<TransactionCommitCostEstimation> ssTrTagCommitCost)
+	  : ssTrTagCommitCost(ssTrTagCommitCost) {}
+
+	template <class Ar>
+	void serialize(Ar& ar) {
+		serializer(ar, ssTrTagCommitCost, reply);
 	}
 };
 

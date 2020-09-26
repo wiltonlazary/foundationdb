@@ -32,6 +32,7 @@
 struct SatelliteInfo {
 	Key dcId;
 	int32_t priority;
+	int32_t satelliteDesiredTLogCount = -1;
 
 	SatelliteInfo() : priority(0) {}
 
@@ -41,7 +42,7 @@ struct SatelliteInfo {
 
 	template <class Ar>
 	void serialize(Ar& ar) {
-		serializer(ar, dcId, priority);
+		serializer(ar, dcId, priority, satelliteDesiredTLogCount);
 	}
 };
 
@@ -106,7 +107,7 @@ struct DatabaseConfiguration {
 
 	int expectedLogSets( Optional<Key> dcId ) const {
 		int result = 1;
-		if(dcId.present() && getRegion(dcId.get()).satelliteTLogReplicationFactor > 0) {
+		if(dcId.present() && getRegion(dcId.get()).satelliteTLogReplicationFactor > 0 && usableRegions > 1) {
 			result++;
 		}
 		
@@ -148,9 +149,11 @@ struct DatabaseConfiguration {
 		return std::min(tLogReplicationFactor - 1 - tLogWriteAntiQuorum, storageTeamSize - 1);
 	}
 
-	// MasterProxy Servers
-	int32_t masterProxyCount;
-	int32_t autoMasterProxyCount;
+	// CommitProxy Servers
+	int32_t commitProxyCount;
+	int32_t autoCommitProxyCount;
+	int32_t grvProxyCount;
+	int32_t autoGrvProxyCount;
 
 	// Resolvers
 	int32_t resolverCount;
@@ -177,16 +180,26 @@ struct DatabaseConfiguration {
 	int32_t remoteTLogReplicationFactor;
 	Reference<IReplicationPolicy> remoteTLogPolicy;
 
+	// Backup Workers
+	bool backupWorkerEnabled;
+
 	//Data centers
 	int32_t usableRegions;
 	int32_t repopulateRegionAntiQuorum;
 	std::vector<RegionInfo> regions;
 
 	// Excluded servers (no state should be here)
-	bool isExcludedServer( NetworkAddress ) const;
+	bool isExcludedServer( NetworkAddressList ) const;
 	std::set<AddressExclusion> getExcludedServers() const;
 
-	int32_t getDesiredProxies() const { if(masterProxyCount == -1) return autoMasterProxyCount; return masterProxyCount; }
+	int32_t getDesiredCommitProxies() const {
+		if (commitProxyCount == -1) return autoCommitProxyCount;
+		return commitProxyCount;
+	}
+	int32_t getDesiredGrvProxies() const {
+		if (grvProxyCount == -1) return autoGrvProxyCount;
+		return grvProxyCount;
+	}
 	int32_t getDesiredResolvers() const { if(resolverCount == -1) return autoResolverCount; return resolverCount; }
 	int32_t getDesiredLogs() const { if(desiredTLogCount == -1) return autoDesiredTLogCount; return desiredTLogCount; }
 	int32_t getDesiredRemoteLogs() const { if(remoteDesiredTLogCount == -1) return getDesiredLogs(); return remoteDesiredTLogCount;  }
@@ -202,6 +215,7 @@ struct DatabaseConfiguration {
 		const_cast<DatabaseConfiguration*>(&rhs)->makeConfigurationImmutable();
 		return rawConfiguration == rhs.rawConfiguration;
 	}
+	bool operator!=(DatabaseConfiguration const& rhs) const { return !(*this == rhs); }
 
 	template <class Ar>
 	void serialize(Ar& ar) {
@@ -214,13 +228,7 @@ struct DatabaseConfiguration {
 		}
 	}
 
-	void fromKeyValues( Standalone<VectorRef<KeyValueRef>> rawConfig ) {
-		resetInternal();
-		this->rawConfiguration = rawConfig;
-		for(auto c=rawConfiguration.begin(); c!=rawConfiguration.end(); ++c)
-			setInternal(c->key, c->value);
-		setDefaultReplicationPolicy();
-	}
+	void fromKeyValues(Standalone<VectorRef<KeyValueRef>> rawConfig);
 
 private:
 	Optional< std::map<std::string, std::string> > mutableConfiguration;  // If present, rawConfiguration is not valid
@@ -232,6 +240,9 @@ private:
 	bool setInternal( KeyRef key, ValueRef value );
 	void resetInternal();
 	void setDefaultReplicationPolicy();
+
+	/// Check if the key is overridden by either mutableConfiguration or rawConfiguration
+	bool isOverridden(std::string key) const;
 };
 
 #endif

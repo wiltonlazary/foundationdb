@@ -19,6 +19,7 @@
  */
 
 #include "fdbrpc/IAsyncFile.h"
+#include "flow/crc32c.h"
 
 #if VALGRIND
 #include <memcheck.h>
@@ -31,7 +32,10 @@ public:
 
 	// For read() and write(), the data buffer must remain valid until the future is ready
 	Future<int> read( void* data, int length, int64_t offset ) {
-		return map(m_f->read(data, length, offset), [=](int r) { updateChecksumHistory(false, offset, length, (uint8_t *)data); return r; });
+		return map(m_f->read(data, length, offset), [=](int r) {
+			updateChecksumHistory(false, offset, r, (uint8_t*)data);
+			return r;
+		});
 	}
 	Future<Void> readZeroCopy( void** data, int* length, int64_t offset ) {
 		return map(m_f->readZeroCopy(data, length, offset), [=](Void r) { updateChecksumHistory(false, offset, *length, (uint8_t *)data); return r; });
@@ -56,10 +60,10 @@ public:
 
 	Future<Void> sync() { return m_f->sync(); }
 	Future<Void> flush() { return m_f->flush(); }
-	Future<int64_t> size() { return m_f->size(); }
-	std::string getFilename() { return m_f->getFilename(); }
+	Future<int64_t> size() const override { return m_f->size(); }
+	std::string getFilename() const override { return m_f->getFilename(); }
 	void releaseZeroCopy( void* data, int length, int64_t offset )  { return m_f->releaseZeroCopy(data, length, offset); }
-	int64_t debugFD() { return m_f->debugFD(); }
+	int64_t debugFD() const override { return m_f->debugFD(); }
 
 	AsyncFileWriteChecker(Reference<IAsyncFile> f) : m_f(f) {
 		// Initialize the static history budget the first time (and only the first time) a file is opened.
@@ -116,7 +120,7 @@ private:
 		}
 
 		while(page < pageEnd) {
-			uint32_t checksum = hashlittle(start, checksumHistoryPageSize, 0xab12fd93);
+			uint32_t checksum = crc32c_append(0xab12fd93, start, checksumHistoryPageSize);
 			WriteInfo &history = checksumHistory[page];
 			//printf("%d %d %u %u\n", write, page, checksum, history.checksum);
 

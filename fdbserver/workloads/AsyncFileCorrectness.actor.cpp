@@ -79,7 +79,7 @@ struct AsyncFileCorrectnessWorkload : public AsyncFileWorkload
 	PerfIntCounter numOperations;
 
 	AsyncFileCorrectnessWorkload(WorkloadContext const& wcx)
-		: AsyncFileWorkload(wcx), success(true), numOperations("Num Operations"), memoryFile(NULL)
+		: AsyncFileWorkload(wcx), success(true), numOperations("Num Operations"), memoryFile(nullptr)
 	{
 		maxOperationSize = getOption(options, LiteralStringRef("maxOperationSize"), 4096);
 		numSimultaneousOperations = getOption(options, LiteralStringRef("numSimultaneousOperations"), 10);
@@ -300,17 +300,13 @@ struct AsyncFileCorrectnessWorkload : public AsyncFileWorkload
 			{
 				int64_t maxOffset;
 
-				//Reads should not exceed the extent of written data
-				if(info.operation == READ)
-				{
+				// Reads should not exceed the extent of written data
+				if (info.operation == READ) {
 					maxOffset = fileSize - 1;
-					if(maxOffset < 0)
-						info.operation = WRITE;
+					if (maxOffset < 0) info.operation = WRITE;
+					// Only allow reads once the file has gotten large enough (to prevent blocking on locks)
+					if (maxOffset < targetFileSize / 2) info.operation = WRITE;
 				}
-
-				//Only allow reads once the file has gotten large enough (to prevent blocking on locks)
-				if(maxOffset < targetFileSize / 2)
-					info.operation = WRITE;
 
 				//Writes can be up to the target file size or the current file size (the current file size could be larger than the target as a result of a truncate)
 				if(info.operation == WRITE)
@@ -447,7 +443,7 @@ struct AsyncFileCorrectnessWorkload : public AsyncFileWorkload
 		}
 		else if(info.operation == SYNC)
 		{
-			info.data = Reference<AsyncFileBuffer>(NULL);
+			info.data = Reference<AsyncFileBuffer>(nullptr);
 			wait(self->fileHandle->file->sync());
 		}
 		else if(info.operation == REOPEN)

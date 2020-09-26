@@ -59,12 +59,13 @@ Future< Reference<class IAsyncFile> > Net2FileSystem::open( std::string filename
 	Future<Reference<IAsyncFile>> f;
 #ifdef __linux__
 	// In the vast majority of cases, we wish to use Kernel AIO. However, some systems
-	// dont properly support don’t properly support kernel async I/O without O_DIRECT
-	// or AIO at all. In such cases, DISABLE_POSIX_KERNEL_AIO knob can be enabled to fallback to
-	// EIO instead of Kernel AIO.
+	// don’t properly support kernel async I/O without O_DIRECT or AIO at all. In such
+	// cases, DISABLE_POSIX_KERNEL_AIO knob can be enabled to fallback to EIO instead
+	// of Kernel AIO. And EIO_USE_ODIRECT can be used to turn on or off O_DIRECT within
+	// EIO.
 	if ((flags & IAsyncFile::OPEN_UNBUFFERED) && !(flags & IAsyncFile::OPEN_NO_AIO) &&
 	    !FLOW_KNOBS->DISABLE_POSIX_KERNEL_AIO)
-		f = AsyncFileKAIO::open(filename, flags, mode, NULL);
+		f = AsyncFileKAIO::open(filename, flags, mode, nullptr);
 	else
 #endif
 	f = Net2AsyncFile::open(filename, flags, mode, static_cast<boost::asio::io_service*> ((void*) g_network->global(INetwork::enASIOService)));
@@ -92,7 +93,8 @@ Net2FileSystem::Net2FileSystem(double ioTimeout, std::string fileSystemPath)
 {
 	Net2AsyncFile::init();
 #ifdef __linux__
-	AsyncFileKAIO::init( Reference<IEventFD>(N2::ASIOReactor::getEventFD()), ioTimeout );
+	if (!FLOW_KNOBS->DISABLE_POSIX_KERNEL_AIO)
+		AsyncFileKAIO::init( Reference<IEventFD>(N2::ASIOReactor::getEventFD()), ioTimeout );
 
 	if (fileSystemPath.empty()) {
 		checkFileSystem = false;
@@ -107,9 +109,13 @@ Net2FileSystem::Net2FileSystem(double ioTimeout, std::string fileSystemPath)
 					criticalError(FDB_EXIT_ERROR, "FileSystemError", format("`%s' is not a mount point", fileSystemPath.c_str()).c_str());
 				}
 			}
-		} catch (Error& e) {
+		} catch (Error&) {
 			criticalError(FDB_EXIT_ERROR, "FileSystemError", format("Could not get device id from `%s'", fileSystemPath.c_str()).c_str());
 		}
 	}
 #endif
+}
+
+void Net2FileSystem::stop() {
+	Net2AsyncFile::stop();
 }

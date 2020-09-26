@@ -45,10 +45,15 @@ class AsyncFileEIO : public IAsyncFile, public ReferenceCounted<AsyncFileEIO> {
 
 public:
 	static void init() {
-		if (eio_init( &eio_want_poll, NULL )) { 
+		eio_set_max_parallel(FLOW_KNOBS->EIO_MAX_PARALLELISM);
+		if (eio_init( &eio_want_poll, nullptr )) {
 			TraceEvent("EioInitError").detail("ErrorNo", errno);
 			throw platform_error(); 
 		}
+	}
+
+	static void stop() {
+		eio_set_max_parallel(0);
 	}
 
 	static bool should_poll() { return want_poll; }
@@ -110,26 +115,26 @@ public:
 	virtual void addref() { ReferenceCounted<AsyncFileEIO>::addref(); }
 	virtual void delref() { ReferenceCounted<AsyncFileEIO>::delref(); }
 
-	virtual int64_t debugFD() { return fd; }
+	int64_t debugFD() const override { return fd; }
 
-	virtual Future<int> read( void* data, int length, int64_t offset ) {
+	Future<int> read(void* data, int length, int64_t offset) override {
 		++countFileLogicalReads;
 		++countLogicalReads;
 		return read_impl(fd, data, length, offset);
 	}
-	virtual Future<Void> write( void const* data, int length, int64_t offset ) // Copies data synchronously
+	Future<Void> write(void const* data, int length, int64_t offset) override // Copies data synchronously
 	{
 		++countFileLogicalWrites;
 		++countLogicalWrites;
 		//Standalone<StringRef> copy = StringRef((const uint8_t*)data, length);
 		return write_impl( fd, err, StringRef((const uint8_t*)data, length), offset );
 	}
-	virtual Future<Void> truncate( int64_t size ) {
+	Future<Void> truncate(int64_t size) override {
 		++countFileLogicalWrites;
 		++countLogicalWrites;
 		return truncate_impl( fd, err, size );
 	}
-	virtual Future<Void> sync() {
+	Future<Void> sync() override {
 		++countFileLogicalWrites;
 		++countLogicalWrites;
 		auto fsync = sync_impl( fd, err );
@@ -142,14 +147,12 @@ public:
 
 		return fsync;
 	}
-	virtual Future<int64_t> size() {
+	Future<int64_t> size() const override {
 		++countFileLogicalReads;
 		++countLogicalReads;
 		return size_impl(fd);
 	}
-	virtual std::string getFilename() {
-		return filename;
-	}
+	std::string getFilename() const override { return filename; }
 
 	ACTOR static Future<Void> async_fsync_parent( std::string filename ) {
 		std::string folder = parentDirectory( filename );
@@ -222,11 +225,11 @@ private:
 	int fd, flags;
 	Reference<ErrorInfo> err;
 	std::string filename;
-	Int64MetricHandle countFileLogicalWrites;
-	Int64MetricHandle countFileLogicalReads;
+	mutable Int64MetricHandle countFileLogicalWrites;
+	mutable Int64MetricHandle countFileLogicalReads;
 
-	Int64MetricHandle countLogicalWrites;
-	Int64MetricHandle countLogicalReads;
+	mutable Int64MetricHandle countLogicalWrites;
+	mutable Int64MetricHandle countLogicalReads;
 
 	AsyncFileEIO( int fd, int flags, std::string const& filename ) : fd(fd), flags(flags), filename(filename), err(new ErrorInfo) {
 		if( !g_network->isSimulated() ) {
@@ -246,6 +249,9 @@ private:
 		if( flags & OPEN_READONLY )  oflags |= O_RDONLY;
 		if( flags & OPEN_READWRITE ) oflags |= O_RDWR;
 		if( flags & OPEN_ATOMIC_WRITE_AND_CREATE ) oflags |= O_TRUNC;
+#if defined(__linux__)
+		if ( flags & OPEN_UNBUFFERED && FLOW_KNOBS->EIO_USE_ODIRECT ) oflags |= O_DIRECT;
+#endif
 		return oflags;
 	}
 
@@ -407,7 +413,7 @@ private:
 		return data.result.get();
 	}
 
-	static volatile int32_t want_poll;
+	static std::atomic<int32_t> want_poll;
 
 	ACTOR static void poll_eio() {
 		while (eio_poll() == -1)
@@ -417,8 +423,8 @@ private:
 
 	static void eio_want_poll() {
 		want_poll = 1;
-		// SOMEDAY: NULL for deferred error, no analysis of correctness (itp)
-		onMainThreadVoid([](){ poll_eio(); }, NULL, TaskPriority::PollEIO);
+		// SOMEDAY: nullptr for deferred error, no analysis of correctness (itp)
+		onMainThreadVoid([](){ poll_eio(); }, nullptr, TaskPriority::PollEIO);
 	}
 
 	static int eio_callback( eio_req* req ) {
@@ -437,7 +443,7 @@ private:
 };
 
 #ifdef FILESYSTEM_IMPL
-volatile int32_t AsyncFileEIO::want_poll = 0;
+std::atomic<int32_t> AsyncFileEIO::want_poll = 0;
 #endif
 
 #include "flow/unactorcompiler.h"

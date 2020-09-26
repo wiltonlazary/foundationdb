@@ -20,7 +20,11 @@ Ready to operate an externally accessible FoundationDB cluster? You'll find what
 
 * :doc:`backups` covers the FoundationDB backup tool, which provides an additional level of protection by supporting recovery from disasters or unintentional modification of the database.
 
+* :doc:`disk-snapshot-backup` covers disk snapshot based FoundationDB backup tool, which is an alternate backup solution.
+
 * :doc:`platforms` describes issues on particular platforms that affect the operation of FoundationDB.
+
+* :doc:`transaction-tagging` gives an overview of transaction tagging, including details about throttling particular tags.
 
 .. toctree::
  :maxdepth: 2
@@ -34,4 +38,6 @@ Ready to operate an externally accessible FoundationDB cluster? You'll find what
  mr-status
  tls
  backups
+ disk-snapshot-backup
  platforms
+ transaction-tagging

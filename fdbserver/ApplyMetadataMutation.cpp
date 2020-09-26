@@ -43,11 +43,18 @@ Reference<StorageInfo> getStorageInfo(UID id, std::map<UID, Reference<StorageInf
 }
 
 // It is incredibly important that any modifications to txnStateStore are done in such a way that
-// the same operations will be done on all proxies at the same time. Otherwise, the data stored in
-// txnStateStore will become corrupted.
-void applyMetadataMutations(UID const& dbgid, Arena &arena, VectorRef<MutationRef> const& mutations, IKeyValueStore* txnStateStore, LogPushData* toCommit, bool *confChange, Reference<ILogSystem> logSystem, Version popVersion,
-	KeyRangeMap<std::set<Key> >* vecBackupKeys, KeyRangeMap<ServerCacheInfo>* keyInfo, std::map<Key, applyMutationsData>* uid_applyMutationsData, RequestStream<CommitTransactionRequest> commit,
-	Database cx, NotifiedVersion* commitVersion, std::map<UID, Reference<StorageInfo>>* storageCache, std::map<Tag, Version>* tag_popped, bool initialCommit ) {
+// the same operations will be done on all commit proxies at the same time. Otherwise, the data 
+// stored in txnStateStore will become corrupted.
+void applyMetadataMutations(UID const& dbgid, Arena& arena, VectorRef<MutationRef> const& mutations,
+                            IKeyValueStore* txnStateStore, LogPushData* toCommit, bool& confChange,
+                            Reference<ILogSystem> logSystem, Version popVersion,
+                            KeyRangeMap<std::set<Key>>* vecBackupKeys, KeyRangeMap<ServerCacheInfo>* keyInfo,
+                            KeyRangeMap<bool>* cacheInfo, std::map<Key, ApplyMutationsData>* uid_applyMutationsData,
+                            RequestStream<CommitTransactionRequest> commit, Database cx, NotifiedVersion* commitVersion,
+                            std::map<UID, Reference<StorageInfo>>* storageCache, std::map<Tag, Version>* tag_popped,
+                            bool initialCommit) {
+	//std::map<keyRef, vector<uint16_t>> cacheRangeInfo;
+	std::map<KeyRef, MutationRef> cachedRangeInfo;
 	for (auto const& m : mutations) {
 		//TraceEvent("MetadataMutation", dbgid).detail("M", m.toString());
 
@@ -59,7 +66,10 @@ void applyMetadataMutations(UID const& dbgid, Arena &arena, VectorRef<MutationRe
 						KeyRef end = keyInfo->rangeContaining(k).end();
 						KeyRangeRef insertRange(k,end);
 						vector<UID> src, dest;
-						decodeKeyServersValue(m.param2, src, dest);
+						// txnStateStore is always an in-memory KVS, and must always be recovered before
+						// applyMetadataMutations is called, so a wait here should never be needed.
+						Future<Standalone<RangeResultRef>> fResult = txnStateStore->readRange(serverTagKeys);
+						decodeKeyServersValue(fResult.get(), m.param2, src, dest);
 
 						ASSERT(storageCache);
 						ServerCacheInfo info;
@@ -129,16 +139,48 @@ void applyMetadataMutations(UID const& dbgid, Arena &arena, VectorRef<MutationRe
 						}
 					}
 				}
+			} else if (m.param1.startsWith(storageCachePrefix)) {
+				if(cacheInfo) {
+					KeyRef k = m.param1.removePrefix(storageCachePrefix);
+
+						// Create a private mutation for storage servers
+						// This is done to make the storage servers aware of the cached key-ranges
+						if(toCommit)
+						{
+							MutationRef privatized = m;
+							privatized.param1 = m.param1.withPrefix(systemKeys.begin, arena);
+							//TraceEvent(SevDebug, "SendingPrivateMutation", dbgid).detail("Original", m.toString()).detail("Privatized", privatized.toString());
+							cachedRangeInfo[k] = privatized;
+						}
+					if(k != allKeys.end) {
+						KeyRef end = cacheInfo->rangeContaining(k).end();
+						vector<uint16_t> serverIndices;
+						decodeStorageCacheValue(m.param2, serverIndices);
+						cacheInfo->insert(KeyRangeRef(k,end),serverIndices.size() > 0);
+					}
+				}
+				if(!initialCommit) txnStateStore->set(KeyValueRef(m.param1, m.param2));
+			} else if (m.param1.startsWith(cacheKeysPrefix)) {
+				// Create a private mutation for cache servers
+				// This is done to make the cache servers aware of the cached key-ranges
+				if(toCommit) {
+					MutationRef privatized = m;
+					privatized.param1 = m.param1.withPrefix(systemKeys.begin, arena);
+					//TraceEvent(SevDebug, "SendingPrivateMutation", dbgid).detail("Original", m.toString()).detail("Privatized", privatized.toString());
+					toCommit->addTag( cacheTag );
+					toCommit->addTypedMessage(privatized);
+				}
 			}
 			else if (m.param1.startsWith(configKeysPrefix) || m.param1 == coordinatorsKey) {
 				if(Optional<StringRef>(m.param2) != txnStateStore->readValue(m.param1).get().castTo<StringRef>()) { // FIXME: Make this check more specific, here or by reading configuration whenever there is a change
-					if(!m.param1.startsWith( excludedServersPrefix ) && m.param1 != excludedServersVersionKey) {
+					if((!m.param1.startsWith( excludedServersPrefix ) && m.param1 != excludedServersVersionKey) &&
+						(!m.param1.startsWith( failedServersPrefix ) && m.param1 != failedServersVersionKey)) {
 						auto t = txnStateStore->readValue(m.param1).get();
 						TraceEvent("MutationRequiresRestart", dbgid)
 							.detail("M", m.toString())
 							.detail("PrevValue", t.present() ? t.get() : LiteralStringRef("(none)"))
-							.detail("ToCommit", toCommit!=NULL);
-						if(confChange) *confChange = true;
+							.detail("ToCommit", toCommit!=nullptr);
+						confChange = true;
 					}
 				}
 				if(!initialCommit) txnStateStore->set(KeyValueRef(m.param1, m.param2));
@@ -170,7 +212,7 @@ void applyMetadataMutations(UID const& dbgid, Arena &arena, VectorRef<MutationRe
 			}
 			else if (m.param1.startsWith(applyMutationsEndRange.begin)) {
 				if(!initialCommit) txnStateStore->set(KeyValueRef(m.param1, m.param2));
-				if(uid_applyMutationsData != NULL) {
+				if(uid_applyMutationsData != nullptr) {
 					Key uid = m.param1.removePrefix(applyMutationsEndRange.begin);
 					auto &p = (*uid_applyMutationsData)[uid];
 					p.endVersion = BinaryReader::fromStringRef<Version>(m.param2, Unversioned());
@@ -189,7 +231,7 @@ void applyMetadataMutations(UID const& dbgid, Arena &arena, VectorRef<MutationRe
 			}
 			else if (m.param1.startsWith(applyMutationsKeyVersionMapRange.begin)) {
 				if(!initialCommit) txnStateStore->set(KeyValueRef(m.param1, m.param2));
-				if(uid_applyMutationsData != NULL) {
+				if(uid_applyMutationsData != nullptr) {
 					if(m.param1.size() >= applyMutationsKeyVersionMapRange.begin.size() + sizeof(UID)) {
 						Key uid = m.param1.substr(applyMutationsKeyVersionMapRange.begin.size(), sizeof(UID));
 						Key k = m.param1.substr(applyMutationsKeyVersionMapRange.begin.size() + sizeof(UID));
@@ -204,7 +246,7 @@ void applyMetadataMutations(UID const& dbgid, Arena &arena, VectorRef<MutationRe
 				if(!initialCommit) txnStateStore->set(KeyValueRef(m.param1, m.param2));
 				if (vecBackupKeys) {
 					Key logDestination;
-					KeyRef logRangeBegin = logRangesDecodeKey(m.param1, NULL);
+					KeyRef logRangeBegin = logRangesDecodeKey(m.param1, nullptr);
 					Key	logRangeEnd = logRangesDecodeValue(m.param2, &logDestination);
 
 					// Insert the logDestination into each range of vecBackupKeys overlapping the decoded range
@@ -239,6 +281,7 @@ void applyMetadataMutations(UID const& dbgid, Arena &arena, VectorRef<MutationRe
 							allTags.insert(decodeServerTagValue(kv.value));
 						}
 					}
+					allTags.insert(cacheTag);
 
 					if (m.param1 == lastEpochEndKey) {
 						toCommit->addTags(allTags);
@@ -253,9 +296,9 @@ void applyMetadataMutations(UID const& dbgid, Arena &arena, VectorRef<MutationRe
 			}
 			else if (m.param1 == minRequiredCommitVersionKey) {
 				Version requested = BinaryReader::fromStringRef<Version>(m.param2, Unversioned());
-				TraceEvent("MinRequiredCommitVersion", dbgid).detail("Min", requested).detail("Current", popVersion).detail("HasConf", !!confChange);
+				TraceEvent("MinRequiredCommitVersion", dbgid).detail("Min", requested).detail("Current", popVersion);
 				if(!initialCommit) txnStateStore->set(KeyValueRef(m.param1, m.param2));
-				if (confChange) *confChange = true;
+				confChange = true;
 				TEST(true);  // Recovering at a higher version.
 			}
 		}
@@ -273,9 +316,9 @@ void applyMetadataMutations(UID const& dbgid, Arena &arena, VectorRef<MutationRe
 			}
 			if (configKeys.intersects(range)) {
 				if(!initialCommit) txnStateStore->clear(range & configKeys);
-				if(!excludedServersKeys.contains(range)) {
+				if(!excludedServersKeys.contains(range) && !failedServersKeys.contains(range)) {
 					TraceEvent("MutationRequiresRestart", dbgid).detail("M", m.toString());
-					if(confChange) *confChange = true;
+					confChange = true;
 				}
 			}
 			if ( serverListKeys.intersects( range )) {
@@ -291,11 +334,14 @@ void applyMetadataMutations(UID const& dbgid, Arena &arena, VectorRef<MutationRe
 					auto serverKeysCleared = txnStateStore->readRange( range & serverTagKeys ).get();	// read is expected to be immediately available
 					for(auto &kv : serverKeysCleared) {
 						Tag tag = decodeServerTagValue(kv.value);
-						TraceEvent("ServerTagRemove").detail("PopVersion", popVersion).detail("Tag", tag.toString()).detail("Server", decodeServerTagKey(kv.key));
-						logSystem->pop( popVersion, decodeServerTagValue(kv.value) );
+						TraceEvent("ServerTagRemove")
+						    .detail("PopVersion", popVersion)
+						    .detail("Tag", tag.toString())
+						    .detail("Server", decodeServerTagKey(kv.key));
+						logSystem->pop(popVersion, decodeServerTagValue(kv.value));
 						(*tag_popped)[tag] = popVersion;
 
-						if(toCommit) {
+						if (toCommit) {
 							MutationRef privatized = m;
 							privatized.param1 = kv.key.withPrefix(systemKeys.begin, arena);
 							privatized.param2 = keyAfter(kv.key, arena).withPrefix(systemKeys.begin, arena);
@@ -344,7 +390,7 @@ void applyMetadataMutations(UID const& dbgid, Arena &arena, VectorRef<MutationRe
 			if(range.intersects(applyMutationsEndRange)) {
 				KeyRangeRef commonEndRange(range & applyMutationsEndRange);
 				if(!initialCommit) txnStateStore->clear(commonEndRange);
-				if(uid_applyMutationsData != NULL) {
+				if(uid_applyMutationsData != nullptr) {
 					uid_applyMutationsData->erase(uid_applyMutationsData->lower_bound(m.param1.substr(applyMutationsEndRange.begin.size())),
 						m.param2 == applyMutationsEndRange.end ? uid_applyMutationsData->end() : uid_applyMutationsData->lower_bound(m.param2.substr(applyMutationsEndRange.begin.size())));
 				}
@@ -352,7 +398,7 @@ void applyMetadataMutations(UID const& dbgid, Arena &arena, VectorRef<MutationRe
 			if(range.intersects(applyMutationsKeyVersionMapRange)) {
 				KeyRangeRef commonApplyRange(range & applyMutationsKeyVersionMapRange);
 				if(!initialCommit) txnStateStore->clear(commonApplyRange);
-				if(uid_applyMutationsData != NULL) {
+				if(uid_applyMutationsData != nullptr) {
 					if(m.param1.size() >= applyMutationsKeyVersionMapRange.begin.size() + sizeof(UID) && m.param2.size() >= applyMutationsKeyVersionMapRange.begin.size() + sizeof(UID)) {
 						Key uid = m.param1.substr(applyMutationsKeyVersionMapRange.begin.size(), sizeof(UID));
 						Key uid2 = m.param2.substr(applyMutationsKeyVersionMapRange.begin.size(), sizeof(UID));
@@ -388,7 +434,7 @@ void applyMetadataMutations(UID const& dbgid, Arena &arena, VectorRef<MutationRe
 					for (auto logRangeAffected : logRangesAffected)
 					{
 						// Parse the backup key and name
-						logKeyBegin = logRangesDecodeKey(logRangeAffected.key, NULL);
+						logKeyBegin = logRangesDecodeKey(logRangeAffected.key, nullptr);
 
 						// Decode the log destination and key value
 						logKeyEnd = logRangesDecodeValue(logRangeAffected.value, &logDestination);
@@ -433,4 +479,96 @@ void applyMetadataMutations(UID const& dbgid, Arena &arena, VectorRef<MutationRe
 			}
 		}
 	}
+
+	// If we accumulated private mutations for cached key-ranges, we also need to
+	// tag them with the relevant storage servers. This is done to make the storage
+	// servers aware of the cached key-ranges
+	// NOTE: we are assuming non-colliding cached key-ranges
+
+	// TODO Note that, we are currently not handling the case when cached key-ranges move out
+	// to different storage servers. This would require some checking when keys in the keyServersPrefix change.
+	// For the first implementation, we could just send the entire map to every storage server. Revisit!
+	if (cachedRangeInfo.size() != 0 && toCommit) {
+		std::map<KeyRef, MutationRef>::iterator itr;
+		KeyRef keyBegin, keyEnd;
+		vector<uint16_t> serverIndices;
+		MutationRef mutationBegin, mutationEnd;
+
+		for (itr = cachedRangeInfo.begin(); itr != cachedRangeInfo.end(); ++itr) {
+			// first figure out the begin and end keys for the cached-range,
+			// the begin and end mutations can be in any order
+			decodeStorageCacheValue(itr->second.param2, serverIndices);
+			// serverIndices count should be greater than zero for beginKey mutations
+			if (serverIndices.size() > 0) {
+				keyBegin = itr->first;
+				mutationBegin = itr->second;
+				++itr;
+				if (itr != cachedRangeInfo.end()) {
+					keyEnd = itr->first;
+					mutationEnd = itr->second;
+				} else {
+					//TraceEvent(SevDebug, "EndKeyNotFound", dbgid).detail("KeyBegin", keyBegin.toString());
+					break;
+				}
+			} else {
+				keyEnd = itr->first;
+				mutationEnd = itr->second;
+				++itr;
+				if (itr != cachedRangeInfo.end()) {
+					keyBegin = itr->first;
+					mutationBegin = itr->second;
+				} else {
+					//TraceEvent(SevDebug, "BeginKeyNotFound", dbgid).detail("KeyEnd", keyEnd.toString());
+					break;
+				}
+			}
+
+			// Now get all the storage server tags for the cached key-ranges
+			std::set<Tag> allTags;
+			auto ranges = keyInfo->intersectingRanges(KeyRangeRef(keyBegin, keyEnd));
+			for(auto it : ranges) {
+				auto& r = it.value();
+				for(auto info : r.src_info) {
+					allTags.insert(info->tag);
+				}
+				for(auto info : r.dest_info) {
+					allTags.insert(info->tag);
+				}
+			}
+
+			// Add the tags to both begin and end mutations
+			toCommit->addTags(allTags);
+			toCommit->addTypedMessage(mutationBegin);
+			toCommit->addTags(allTags);
+			toCommit->addTypedMessage(mutationEnd);
+		}
+	}
+}
+
+void applyMetadataMutations(ProxyCommitData& proxyCommitData, Arena& arena, Reference<ILogSystem> logSystem,
+                            const VectorRef<MutationRef>& mutations, LogPushData* toCommit, bool& confChange,
+                            Version popVersion, bool initialCommit) {
+
+	std::map<Key, ApplyMutationsData>* uid_applyMutationsData = nullptr;
+	if (proxyCommitData.firstProxy) {
+		uid_applyMutationsData = &proxyCommitData.uid_applyMutationsData;
+	}
+
+	applyMetadataMutations(proxyCommitData.dbgid, arena, mutations, proxyCommitData.txnStateStore, toCommit, confChange,
+	                       logSystem, popVersion, &proxyCommitData.vecBackupKeys, &proxyCommitData.keyInfo,
+	                       &proxyCommitData.cacheInfo, uid_applyMutationsData, proxyCommitData.commit,
+	                       proxyCommitData.cx, &proxyCommitData.committedVersion, &proxyCommitData.storageCache,
+	                       &proxyCommitData.tag_popped, initialCommit);
+}
+
+void applyMetadataMutations(const UID& dbgid, Arena& arena, const VectorRef<MutationRef>& mutations,
+                            IKeyValueStore* txnStateStore) {
+
+	bool confChange; // Dummy variable, not used.
+
+	applyMetadataMutations(dbgid, arena, mutations, txnStateStore, /* toCommit= */ nullptr, confChange,
+	                       Reference<ILogSystem>(), /* popVersion= */ 0, /* vecBackupKeys= */ nullptr,
+	                       /* keyInfo= */ nullptr, /* cacheInfo= */ nullptr, /* uid_applyMutationsData= */ nullptr,
+	                       RequestStream<CommitTransactionRequest>(), Database(), /* commitVersion= */ nullptr,
+	                       /* storageCache= */ nullptr, /* tag_popped= */ nullptr, /* initialCommit= */ false);
 }

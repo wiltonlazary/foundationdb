@@ -21,10 +21,15 @@
 #include "fdbrpc/simulator.h"
 #include "fdbclient/BackupAgent.actor.h"
 #include "fdbclient/BackupContainer.h"
+#include "fdbclient/ManagementAPI.actor.h"
+#include "fdbclient/RestoreWorkerInterface.actor.h"
+#include "fdbclient/RunTransaction.actor.h"
+#include "fdbserver/RestoreCommon.actor.h"
 #include "fdbserver/workloads/workloads.actor.h"
 #include "fdbserver/workloads/BulkSetup.actor.h"
-#include "fdbserver/RestoreWorkerInterface.h"
 #include "flow/actorcompiler.h" // This must be the last #include.
+
+#define TEST_ABORT_FASTRESTORE	0
 
 // A workload which test the correctness of backup and restore process
 struct BackupAndParallelRestoreCorrectnessWorkload : TestWorkload {
@@ -38,6 +43,9 @@ struct BackupAndParallelRestoreCorrectnessWorkload : TestWorkload {
 	bool locked;
 	bool allowPauses;
 	bool shareLogRange;
+	bool usePartitionedLogs;
+	Key addPrefix, removePrefix; // Original key will be first applied removePrefix and then applied addPrefix
+	// CAVEAT: When removePrefix is used, we must ensure every key in backup have the removePrefix
 
 	std::map<Standalone<KeyRef>, Standalone<ValueRef>> dbKVs;
 
@@ -65,10 +73,35 @@ struct BackupAndParallelRestoreCorrectnessWorkload : TestWorkload {
 		agentRequest = getOption(options, LiteralStringRef("simBackupAgents"), true);
 		allowPauses = getOption(options, LiteralStringRef("allowPauses"), true);
 		shareLogRange = getOption(options, LiteralStringRef("shareLogRange"), false);
+		usePartitionedLogs = getOption(options, LiteralStringRef("usePartitionedLogs"),
+		                               deterministicRandom()->random01() < 0.5 ? true : false);
+		addPrefix = getOption(options, LiteralStringRef("addPrefix"), LiteralStringRef(""));
+		removePrefix = getOption(options, LiteralStringRef("removePrefix"), LiteralStringRef(""));
 
 		KeyRef beginRange;
 		KeyRef endRange;
 		UID randomID = nondeterministicRandom()->randomUniqueID();
+
+		// Correctness is not clean for addPrefix feature yet. Uncomment below to enable the test
+		// Generate addPrefix
+		// if (addPrefix.size() == 0 && removePrefix.size() == 0) {
+		// 	if (deterministicRandom()->random01() < 0.5) { // Generate random addPrefix
+		// 		int len = deterministicRandom()->randomInt(1, 100);
+		// 		std::string randomStr = deterministicRandom()->randomAlphaNumeric(len);
+		// 		TraceEvent("BackupAndParallelRestoreCorrectness")
+		// 		    .detail("GenerateAddPrefix", randomStr)
+		// 		    .detail("Length", len)
+		// 		    .detail("StrLen", randomStr.size());
+		// 		addPrefix = Key(randomStr);
+		// 	}
+		// }
+		TraceEvent("BackupAndParallelRestoreCorrectness")
+		    .detail("AddPrefix", addPrefix)
+		    .detail("RemovePrefix", removePrefix);
+		ASSERT(addPrefix.size() == 0 && removePrefix.size() == 0);
+		// Do not support removePrefix right now because we must ensure all backup keys have the removePrefix
+		// otherwise, test will fail because fast restore will simply add the removePrefix to every key in the end.
+		ASSERT(removePrefix.size() == 0);
 
 		if (shareLogRange) {
 			bool beforePrefix = sharedRandomNumber & 1;
@@ -82,8 +115,6 @@ struct BackupAndParallelRestoreCorrectnessWorkload : TestWorkload {
 			backupRanges.push_back_deep(backupRanges.arena(), normalKeys);
 		} else {
 			// Add backup ranges
-			// Q: why the range endpoints (the range interval) are randomly generated?
-			// Won't this cause unbalanced range interval in backup?
 			std::set<std::string> rangeEndpoints;
 			while (rangeEndpoints.size() < backupRangesCount * 2) {
 				rangeEndpoints.insert(deterministicRandom()->randomAlphaNumeric(
@@ -103,171 +134,6 @@ struct BackupAndParallelRestoreCorrectnessWorkload : TestWorkload {
 				    .detail("RangeEnd", (beginRange < endRange) ? printable(endRange) : printable(beginRange));
 			}
 		}
-	}
-
-	static void compareDBKVs(Standalone<RangeResultRef> data, BackupAndParallelRestoreCorrectnessWorkload* self) {
-		bool hasDiff = false;
-		// Get the new KV pairs in the DB
-		std::map<Standalone<KeyRef>, Standalone<ValueRef>> newDbKVs;
-		for (auto kvRef = data.contents().begin(); kvRef != data.contents().end(); kvRef++) {
-			newDbKVs.insert(std::make_pair(kvRef->key, kvRef->value));
-		}
-
-		if (self->dbKVs.empty()) {
-			printf("[CheckDB] set DB kv for the first time.\n");
-			self->dbKVs = newDbKVs;
-			return;
-		}
-
-		printf("[CheckDB] KV Number. Prev DB:%d Current DB:%d\n", self->dbKVs.size(), newDbKVs.size());
-		// compare the KV pairs in the DB
-		printf("------------------Now print out the diff between the prev DB and current DB-------------------\n");
-		if (self->dbKVs.size() >= newDbKVs.size()) {
-			for (auto kv = self->dbKVs.begin(); kv != self->dbKVs.end(); kv++) {
-				bool exist = (newDbKVs.find(kv->first) != newDbKVs.end());
-				if (!exist) {
-					printf("\tPrevKey:%s PrevValue:%s newValue:%s\n", getHexString(kv->first).c_str(),
-					       getHexString(kv->second).c_str(), "[Not Exist]");
-					hasDiff = true;
-				}
-				if (exist && (newDbKVs[kv->first] != self->dbKVs[kv->first])) {
-					printf("\tPrevKey:%s PrevValue:%s newValue:%s\n", getHexString(kv->first).c_str(),
-					       getHexString(kv->second).c_str(), getHexString(newDbKVs[kv->first]).c_str());
-					hasDiff = true;
-				}
-			}
-		} else {
-			for (auto newKV = newDbKVs.begin(); newKV != newDbKVs.end(); newKV++) {
-				bool exist = (self->dbKVs.find(newKV->first) != self->dbKVs.end());
-				if (!exist) {
-					printf("\tPrevKey:%s PrevValue:%s newValue:%s\n", "[Not Exist]", getHexString(newKV->first).c_str(),
-					       getHexString(newKV->second).c_str());
-					hasDiff = true;
-				}
-				if (exist && (newDbKVs[newKV->first] != self->dbKVs[newKV->first])) {
-					printf("\tPrevKey:%s PrevValue:%s newValue:%s\n", getHexString(newKV->first).c_str(),
-					       getHexString(self->dbKVs[newKV->first]).c_str(),
-					       getHexString(newDbKVs[newKV->first]).c_str());
-					hasDiff = true;
-				}
-			}
-		}
-
-		int numEntries = 10;
-		int i = 0;
-		if (hasDiff) {
-			// print out the first and last 10 entries
-			printf("\t---Prev DB first and last %d entries\n", numEntries);
-			if (!self->dbKVs.empty()) {
-				auto kv = self->dbKVs.begin();
-				for (; kv != self->dbKVs.end(); kv++) {
-					if (i >= numEntries) break;
-
-					printf("\t[Entry:%d]Key:%s Value:%s\n", i++, getHexString(kv->first).c_str(),
-					       getHexString(kv->second).c_str());
-				}
-
-				i = self->dbKVs.size();
-				kv = self->dbKVs.end();
-				for (--kv; kv != self->dbKVs.begin(); kv--) {
-					if (i <= self->dbKVs.size() - numEntries) break;
-
-					printf("\t[Entry:%d]Key:%s Value:%s\n", i--, getHexString(kv->first).c_str(),
-					       getHexString(kv->second).c_str());
-				}
-			}
-
-			printf("\t---Current DB first and last %d entries\n", numEntries);
-			if (!newDbKVs.empty()) {
-				auto kv = newDbKVs.begin();
-				i = 0;
-				for (; kv != newDbKVs.end(); kv++) {
-					if (i >= numEntries) break;
-
-					printf("\t[Entry:%d]Key:%s Value:%s\n", i++, getHexString(kv->first).c_str(),
-					       getHexString(kv->second).c_str());
-				}
-
-				i = newDbKVs.size();
-				kv = newDbKVs.end();
-				for (--kv; kv != newDbKVs.begin(); kv--) {
-					if (i <= newDbKVs.size() - numEntries) break;
-
-					printf("\t[Entry:%d]Key:%s Value:%s\n", i--, getHexString(kv->first).c_str(),
-					       getHexString(kv->second).c_str());
-				}
-			}
-		}
-
-		self->dbKVs = newDbKVs; // update the dbKVs
-	}
-
-	static void dumpDBKVs(Standalone<RangeResultRef> data, BackupAndParallelRestoreCorrectnessWorkload* self) {
-		// bool hasDiff = false;
-		// Get the new KV pairs in the DB
-		std::map<Standalone<KeyRef>, Standalone<ValueRef>> newDbKVs;
-		for (auto kvRef = data.contents().begin(); kvRef != data.contents().end(); kvRef++) {
-			newDbKVs.insert(std::make_pair(kvRef->key, kvRef->value));
-		}
-
-		printf("---------------------Now print out the KV in the current DB---------------------\n");
-		for (auto newKV = newDbKVs.begin(); newKV != newDbKVs.end(); newKV++) {
-			printf("\tKey:%s Value:%s\n", getHexString(newKV->first).c_str(), getHexString(newKV->second).c_str());
-		}
-	}
-
-	ACTOR static Future<Void> checkDB(Database cx, std::string when,
-	                                  BackupAndParallelRestoreCorrectnessWorkload* self) {
-
-		return Void();
-
-		//    state Key keyPrefix = LiteralStringRef("");
-		//    //              int numPrint = 20; //number of entries in the front and end to print out.
-		//    state Transaction tr(cx);
-		//    state int retryCount = 0;
-		//    loop {
-		//            try {
-		//                    state Version v = wait( tr.getReadVersion() );
-		//                    state Standalone<RangeResultRef> data = wait(tr.getRange(firstGreaterOrEqual(doubleToTestKey(0.0, keyPrefix)), firstGreaterOrEqual(doubleToTestKey(1.0, keyPrefix)), std::numeric_limits<int>::max()));
-		//                    printf("Check DB, at %s. retryCount:%d Data size:%d, rangeResultInfo:%s\n", when.c_str(), retryCount,
-		//                               data.size(), data.contents().toString().c_str());
-		//                    compareDBKVs(data, self);
-		//                    break;
-		//            } catch (Error& e) {
-		//                    retryCount++;
-		//                    TraceEvent(retryCount > 20 ? SevWarnAlways : SevWarn, "CheckDBError").error(e);
-		//                    wait(tr.onError(e));
-		//            }
-		//    }
-
-		//    return Void();
-
-	}
-
-	ACTOR static Future<Void> dumpDB(Database cx, std::string when, BackupAndParallelRestoreCorrectnessWorkload* self) {
-		state Key keyPrefix = LiteralStringRef("");
-		//		int numPrint = 20; //number of entries in the front and end to print out.
-		state Transaction tr(cx);
-		state int retryCount = 0;
-		loop {
-			try {
-				tr.reset();
-				state Version v = wait(tr.getReadVersion());
-				state Standalone<RangeResultRef> data = wait(
-				    tr.getRange(firstGreaterOrEqual(doubleToTestKey(0.0, keyPrefix)),
-				                firstGreaterOrEqual(doubleToTestKey(1.0, keyPrefix)), std::numeric_limits<int>::max()));
-				printf("dump DB, at %s. retryCount:%d Data size:%d, rangeResultInfo:%s\n", when.c_str(), retryCount,
-				       data.size(), data.contents().toString().c_str());
-				dumpDBKVs(data, self);
-				break;
-			} catch (Error& e) {
-				retryCount++;
-				TraceEvent(retryCount > 20 ? SevWarnAlways : SevWarn, "dumpDBError").error(e);
-				wait(tr.onError(e));
-			}
-		}
-
-		return Void();
 	}
 
 	virtual std::string description() { return "BackupAndParallelRestoreCorrectness"; }
@@ -292,15 +158,17 @@ struct BackupAndParallelRestoreCorrectnessWorkload : TestWorkload {
 		return _start(cx, this);
 	}
 
+	bool hasPrefix() { return addPrefix != LiteralStringRef("") || removePrefix != LiteralStringRef(""); }
+
 	virtual Future<bool> check(Database const& cx) { return true; }
 
 	virtual void getMetrics(vector<PerfMetric>& m) {}
 
 	ACTOR static Future<Void> changePaused(Database cx, FileBackupAgent* backupAgent) {
 		loop {
-			wait(backupAgent->taskBucket->changePause(cx, true));
+			wait(backupAgent->changePause(cx, true));
 			wait(delay(30 * deterministicRandom()->random01()));
-			wait(backupAgent->taskBucket->changePause(cx, false));
+			wait(backupAgent->changePause(cx, false));
 			wait(delay(120 * deterministicRandom()->random01()));
 		}
 	}
@@ -318,10 +186,9 @@ struct BackupAndParallelRestoreCorrectnessWorkload : TestWorkload {
 	                                   FileBackupAgent* backupAgent, Database cx, Key tag,
 	                                   Standalone<VectorRef<KeyRangeRef>> backupRanges, double stopDifferentialDelay,
 	                                   Promise<Void> submittted) {
-
 		state UID randomID = nondeterministicRandom()->randomUniqueID();
-
 		state Future<Void> stopDifferentialFuture = delay(stopDifferentialDelay);
+
 		wait(delay(startDelay));
 
 		if (startDelay || BUGGIFY) {
@@ -346,7 +213,8 @@ struct BackupAndParallelRestoreCorrectnessWorkload : TestWorkload {
 
 		try {
 			wait(backupAgent->submitBackup(cx, StringRef(backupContainer), deterministicRandom()->randomInt(0, 100),
-			                               tag.toString(), backupRanges, stopDifferentialDelay ? false : true));
+			                               tag.toString(), backupRanges, stopDifferentialDelay ? false : true,
+			                               self->usePartitionedLogs));
 		} catch (Error& e) {
 			TraceEvent("BARW_DoBackupSubmitBackupException", randomID).error(e).detail("Tag", printable(tag));
 			if (e.code() != error_code_backup_unneeded && e.code() != error_code_backup_duplicate) throw;
@@ -366,50 +234,53 @@ struct BackupAndParallelRestoreCorrectnessWorkload : TestWorkload {
 				if (BUGGIFY) {
 					state KeyBackedTag backupTag = makeBackupTag(tag.toString());
 					TraceEvent("BARW_DoBackupWaitForRestorable", randomID).detail("Tag", backupTag.tagName);
-					// Wait until the backup is in a restorable state
-					state int resultWait = wait(backupAgent->waitBackup(cx, backupTag.tagName, false));
-					UidAndAbortedFlagT uidFlag = wait(backupTag.getOrThrow(cx));
-					state UID logUid = uidFlag.first;
-					state Reference<IBackupContainer> lastBackupContainer =
-					    wait(BackupConfig(logUid).backupContainer().getD(cx));
+					// Wait until the backup is in a restorable state and get the status, URL, and UID atomically
+					state Reference<IBackupContainer> lastBackupContainer;
+					state UID lastBackupUID;
+					state EBackupState resultWait = wait(
+					    backupAgent->waitBackup(cx, backupTag.tagName, false, &lastBackupContainer, &lastBackupUID));
+
+					TraceEvent("BARW_DoBackupWaitForRestorable", randomID)
+					    .detail("Tag", backupTag.tagName)
+					    .detail("Result", BackupAgentBase::getStateText(resultWait));
 
 					state bool restorable = false;
 					if (lastBackupContainer) {
-						state BackupDescription desc = wait(lastBackupContainer->describeBackup());
-						wait(desc.resolveVersionTimes(cx));
-						printf("BackupDescription:\n%s\n", desc.toString().c_str());
-						restorable = desc.maxRestorableVersion.present();
+						state Future<BackupDescription> fdesc = lastBackupContainer->describeBackup();
+						wait(ready(fdesc));
+
+						if(!fdesc.isError()) {
+							state BackupDescription desc = fdesc.get();
+							wait(desc.resolveVersionTimes(cx));
+							printf("BackupDescription:\n%s\n", desc.toString().c_str());
+							restorable = desc.maxRestorableVersion.present();
+						}
 					}
 
 					TraceEvent("BARW_LastBackupContainer", randomID)
 					    .detail("BackupTag", printable(tag))
 					    .detail("LastBackupContainer", lastBackupContainer ? lastBackupContainer->getURL() : "")
-					    .detail("LogUid", logUid)
-					    .detail("WaitStatus", resultWait)
+					    .detail("LastBackupUID", lastBackupUID)
+					    .detail("WaitStatus", BackupAgentBase::getStateText(resultWait))
 					    .detail("Restorable", restorable);
 
 					// Do not check the backup, if aborted
-					if (resultWait == BackupAgentBase::STATE_ABORTED) {
+					if (resultWait == EBackupState::STATE_ABORTED) {
 					}
 					// Ensure that a backup container was found
 					else if (!lastBackupContainer) {
-						TraceEvent("BARW_MissingBackupContainer", randomID)
-						    .detail("LogUid", logUid)
-						    .detail("BackupTag", printable(tag))
-						    .detail("WaitStatus", resultWait);
-						printf("BackupCorrectnessMissingBackupContainer   tag: %s  status: %d\n",
-						       printable(tag).c_str(), resultWait);
+						TraceEvent(SevError, "BARW_MissingBackupContainer", randomID).detail("LastBackupUID", lastBackupUID).detail("BackupTag", printable(tag)).detail("WaitStatus", resultWait);
+						printf("BackupCorrectnessMissingBackupContainer   tag: %s  status: %s\n",
+						       printable(tag).c_str(), BackupAgentBase::getStateText(resultWait));
 					}
 					// Check that backup is restorable
-					else {
-						if (!restorable) {
-							TraceEvent("BARW_NotRestorable", randomID)
-							    .detail("LogUid", logUid)
-							    .detail("BackupTag", printable(tag))
-							    .detail("BackupFolder", lastBackupContainer->getURL())
-							    .detail("WaitStatus", resultWait);
-							printf("BackupCorrectnessNotRestorable:  tag: %s\n", printable(tag).c_str());
-						}
+					else if (!restorable) {
+						TraceEvent(SevError, "BARW_NotRestorable", randomID)
+						    .detail("LastBackupUID", lastBackupUID)
+						    .detail("BackupTag", printable(tag))
+						    .detail("BackupFolder", lastBackupContainer->getURL())
+						    .detail("WaitStatus", BackupAgentBase::getStateText(resultWait));
+						printf("BackupCorrectnessNotRestorable:  tag: %s\n", printable(tag).c_str());
 					}
 
 					// Abort the backup, if not the first backup because the second backup may have aborted the backup
@@ -417,7 +288,7 @@ struct BackupAndParallelRestoreCorrectnessWorkload : TestWorkload {
 					if (startDelay) {
 						TraceEvent("BARW_DoBackupAbortBackup2", randomID)
 						    .detail("Tag", printable(tag))
-						    .detail("WaitStatus", resultWait)
+						    .detail("WaitStatus", BackupAgentBase::getStateText(resultWait))
 						    .detail("LastBackupContainer", lastBackupContainer ? lastBackupContainer->getURL() : "")
 						    .detail("Restorable", restorable);
 						wait(backupAgent->abortBackup(cx, tag.toString()));
@@ -443,7 +314,7 @@ struct BackupAndParallelRestoreCorrectnessWorkload : TestWorkload {
 
 		// Wait for the backup to complete
 		TraceEvent("BARW_DoBackupWaitBackup", randomID).detail("Tag", printable(tag));
-		state int statusValue = wait(backupAgent->waitBackup(cx, tag.toString(), true));
+		state EBackupState statusValue = wait(backupAgent->waitBackup(cx, tag.toString(), true));
 
 		state std::string statusText;
 
@@ -454,12 +325,11 @@ struct BackupAndParallelRestoreCorrectnessWorkload : TestWorkload {
 		TraceEvent("BARW_DoBackupComplete", randomID)
 		    .detail("Tag", printable(tag))
 		    .detail("Status", statusText)
-		    .detail("StatusValue", statusValue);
+		    .detail("StatusValue", BackupAgentBase::getStateText(statusValue));
 
 		return Void();
 	}
 
-	
 	// This actor attempts to restore the database without clearing the keyspace.
 	// TODO: Enable this function in correctness test
 	ACTOR static Future<Void> attemptDirtyRestore(BackupAndParallelRestoreCorrectnessWorkload* self, Database cx,
@@ -500,6 +370,10 @@ struct BackupAndParallelRestoreCorrectnessWorkload : TestWorkload {
 		state FileBackupAgent backupAgent;
 		state Future<Void> extraBackup;
 		state bool extraTasks = false;
+		state UID randomID = nondeterministicRandom()->randomUniqueID();
+		state int restoreIndex = 0;
+		state ReadYourWritesTransaction tr2(cx);
+
 		TraceEvent("BARW_Arguments")
 		    .detail("BackupTag", printable(self->backupTag))
 		    .detail("PerformRestore", self->performRestore)
@@ -508,7 +382,6 @@ struct BackupAndParallelRestoreCorrectnessWorkload : TestWorkload {
 		    .detail("AbortAndRestartAfter", self->abortAndRestartAfter)
 		    .detail("DifferentialAfter", self->stopDifferentialAfter);
 
-		state UID randomID = nondeterministicRandom()->randomUniqueID();
 		if (self->allowPauses && BUGGIFY) {
 			state Future<Void> cp = changePaused(cx, &backupAgent);
 		}
@@ -523,8 +396,6 @@ struct BackupAndParallelRestoreCorrectnessWorkload : TestWorkload {
 
 			// backup
 			wait(delay(self->backupAfter));
-
-			wait(checkDB(cx, "BeforeStartBackup", self));
 
 			TraceEvent("BARW_DoBackup1", randomID).detail("Tag", printable(self->backupTag));
 			state Promise<Void> submitted;
@@ -554,8 +425,6 @@ struct BackupAndParallelRestoreCorrectnessWorkload : TestWorkload {
 			    .detail("BackupTag", printable(self->backupTag))
 			    .detail("AbortAndRestartAfter", self->abortAndRestartAfter);
 
-			wait(checkDB(cx, "BackupDone", self));
-
 			state KeyBackedTag keyBackedTag = makeBackupTag(self->backupTag.toString());
 			UidAndAbortedFlagT uidFlag = wait(keyBackedTag.getOrThrow(cx));
 			state UID logUid = uidFlag.first;
@@ -567,9 +436,11 @@ struct BackupAndParallelRestoreCorrectnessWorkload : TestWorkload {
 			if (!self->locked && BUGGIFY) {
 				TraceEvent("BARW_SubmitBackup2", randomID).detail("Tag", printable(self->backupTag));
 				try {
-					extraBackup = backupAgent.submitBackup(cx, LiteralStringRef("file://simfdb/backups/"),
-					                                       deterministicRandom()->randomInt(0, 100),
-					                                       self->backupTag.toString(), self->backupRanges, true);
+					// Note the "partitionedLog" must be false, because we change
+					// the configuration to disable backup workers before restore.
+					extraBackup = backupAgent.submitBackup(
+					    cx, LiteralStringRef("file://simfdb/backups/"), deterministicRandom()->randomInt(0, 100),
+					    self->backupTag.toString(), self->backupRanges, true, false);
 				} catch (Error& e) {
 					TraceEvent("BARW_SubmitBackup2Exception", randomID)
 					    .error(e)
@@ -589,6 +460,11 @@ struct BackupAndParallelRestoreCorrectnessWorkload : TestWorkload {
 					// wait(attemptDirtyRestore(self, cx, &backupAgent, StringRef(lastBackupContainer->getURL()),
 					// randomID));
 				}
+
+				// We must ensure no backup workers are running, otherwise the clear DB
+				// below can be picked up by backup workers and applied during restore.
+				wait(success(changeConfig(cx, "backup_worker_enabled:=0", true)));
+
 				// Clear DB before restore
 				wait(runRYWTransaction(cx, [=](Reference<ReadYourWritesTransaction> tr) -> Future<Void> {
 					for (auto& kvrange : self->backupRanges) tr->clear(kvrange);
@@ -603,6 +479,8 @@ struct BackupAndParallelRestoreCorrectnessWorkload : TestWorkload {
 
 				auto container = IBackupContainer::openContainer(lastBackupContainer->getURL());
 				BackupDescription desc = wait(container->describeBackup());
+				ASSERT(self->usePartitionedLogs == desc.partitioned);
+				ASSERT(desc.minRestorableVersion.present()); // We must have a valid backup now.
 
 				state Version targetVersion = -1;
 				if (desc.maxRestorableVersion.present()) {
@@ -610,49 +488,45 @@ struct BackupAndParallelRestoreCorrectnessWorkload : TestWorkload {
 						targetVersion = desc.minRestorableVersion.get();
 					} else if (deterministicRandom()->random01() < 0.1) {
 						targetVersion = desc.maxRestorableVersion.get();
-					} else if (deterministicRandom()->random01() < 0.5) {
+					} else if (deterministicRandom()->random01() < 0.5 &&
+					           desc.minRestorableVersion.get() < desc.contiguousLogEnd.get()) {
+						// The assertion may fail because minRestorableVersion may be decided by snapshot version.
+						// ASSERT_WE_THINK(desc.minRestorableVersion.get() <= desc.contiguousLogEnd.get());
+						// This assertion can fail when contiguousLogEnd < maxRestorableVersion and
+						// the snapshot version > contiguousLogEnd. I.e., there is a gap between
+						// contiguousLogEnd and snapshot version.
+						// ASSERT_WE_THINK(desc.contiguousLogEnd.get() > desc.maxRestorableVersion.get());
 						targetVersion = deterministicRandom()->randomInt64(desc.minRestorableVersion.get(),
 						                                                   desc.contiguousLogEnd.get());
 					}
 				}
 
+				TraceEvent("BAFRW_Restore", randomID)
+				    .detail("LastBackupContainer", lastBackupContainer->getURL())
+				    .detail("MinRestorableVersion", desc.minRestorableVersion.get())
+				    .detail("MaxRestorableVersion", desc.maxRestorableVersion.get())
+				    .detail("ContiguousLogEnd", desc.contiguousLogEnd.get())
+				    .detail("TargetVersion", targetVersion);
+
 				state std::vector<Future<Version>> restores;
 				state std::vector<Standalone<StringRef>> restoreTags;
-				state int restoreIndex;
 
-				// Restore each range by calling backupAgent.restore()
-				printf("Prepare for restore requests. Number of backupRanges:%d\n", self->backupRanges.size());
-				state Transaction tr1(cx);
-				loop {
-					tr1.setOption(FDBTransactionOptions::ACCESS_SYSTEM_KEYS);
-					tr1.setOption(FDBTransactionOptions::LOCK_AWARE);
-					try {
-						printf("Prepare for restore requests. Number of backupRanges:%d\n", self->backupRanges.size());
-						// Note: we always lock DB here in case DB is modified at the bacupRanges boundary.
-						for (restoreIndex = 0; restoreIndex < self->backupRanges.size(); restoreIndex++) {
-							auto range = self->backupRanges[restoreIndex];
-							Standalone<StringRef> restoreTag(self->backupTag.toString() + "_" +
-							                                 std::to_string(restoreIndex));
-							restoreTags.push_back(restoreTag);
-							// Register the request request in DB, which will be picked up by restore worker leader
-							struct RestoreRequest restoreRequest(
-							    restoreIndex, restoreTag, KeyRef(lastBackupContainer->getURL()), true, targetVersion,
-							    true, range, Key(), Key(), self->locked, deterministicRandom()->randomUniqueID());
-							tr1.set(restoreRequestKeyFor(restoreRequest.index), restoreRequestValue(restoreRequest));
-						}
-						tr1.set(restoreRequestTriggerKey,
-						        restoreRequestTriggerValue(deterministicRandom()->randomUniqueID(),
-						                                   self->backupRanges.size()));
-						wait(tr1.commit()); // Trigger restore
-						break;
-					} catch (Error& e) {
-						wait(tr1.onError(e));
-					}
-				};
-				printf("FastRestore:Test workload triggers the restore by setting up restoreRequestTriggerKey\n");
+				// Submit parallel restore requests
+				TraceEvent("BackupAndParallelRestoreWorkload")
+				    .detail("PrepareRestores", self->backupRanges.size())
+				    .detail("AddPrefix", self->addPrefix)
+				    .detail("RemovePrefix", self->removePrefix);
+				wait(backupAgent.submitParallelRestore(cx, self->backupTag, self->backupRanges,
+				                                       KeyRef(lastBackupContainer->getURL()), targetVersion,
+				                                       self->locked, randomID, self->addPrefix, self->removePrefix));
+				TraceEvent("BackupAndParallelRestoreWorkload")
+				    .detail("TriggerRestore", "Setting up restoreRequestTriggerKey");
 
 				// Sometimes kill and restart the restore
-				if (BUGGIFY) {
+				// In real cluster, aborting a restore needs:
+				// (1) kill restore cluster; (2) clear dest. DB restore system keyspace.
+				// TODO: Consider gracefully abort a restore and restart.
+				if (BUGGIFY && TEST_ABORT_FASTRESTORE) {
 					TraceEvent(SevError, "FastRestore").detail("Buggify", "NotImplementedYet");
 					wait(delay(deterministicRandom()->randomInt(0, 10)));
 					for (restoreIndex = 0; restoreIndex < restores.size(); restoreIndex++) {
@@ -673,45 +547,25 @@ struct BackupAndParallelRestoreCorrectnessWorkload : TestWorkload {
 					}
 				}
 
-				// We should wait on all restore before proceeds
-				TraceEvent("FastRestore").detail("BackupAndParallelRestore", "WaitForRestoreToFinish");
-				state bool restoreDone = false;
-				state ReadYourWritesTransaction tr2(cx);
-				state Future<Void> watchForRestoreRequestDone;
-				loop {
-					try {
-						if (restoreDone) break;
-						tr2.reset();
-						tr2.setOption(FDBTransactionOptions::ACCESS_SYSTEM_KEYS);
-						tr2.setOption(FDBTransactionOptions::LOCK_AWARE);
-						Optional<Value> restoreRequestDoneKeyValue = wait(tr2.get(restoreRequestDoneKey));
-						// Restore may finish before restoreAgent waits on the restore finish event.
-						if (restoreRequestDoneKeyValue.present()) {
-							restoreDone = true; // In case commit clears the key but in unknown_state
-							tr2.clear(restoreRequestDoneKey);
-							wait(tr2.commit());
-							break;
-						} else {
-							watchForRestoreRequestDone = tr2.watch(restoreRequestDoneKey);
-							wait(tr2.commit());
-							wait(watchForRestoreRequestDone);
-							break;
-						}
-					} catch (Error& e) {
-						wait(tr2.onError(e));
-					}
-				}
-
-				TraceEvent("FastRestore").detail("BackupAndParallelRestore", "RestoreFinished");
-				wait(checkDB(cx, "FinishRestore", self));
+				// Wait for parallel restore to finish before we can proceed
+				TraceEvent("FastRestoreWorkload").detail("WaitForRestoreToFinish", randomID);
+				// Do not unlock DB when restore finish because we need to transformDatabaseContents
+				wait(backupAgent.parallelRestoreFinish(cx, randomID, !self->hasPrefix()));
+				TraceEvent("FastRestoreWorkload").detail("RestoreFinished", randomID);
 
 				for (auto& restore : restores) {
 					ASSERT(!restore.isError());
 				}
+
+				// If addPrefix or removePrefix set, we want to transform the effect by copying data
+				if (self->hasPrefix()) {
+					wait(transformRestoredDatabase(cx, self->backupRanges, self->addPrefix, self->removePrefix));
+					wait(unlockDatabase(cx, randomID));
+				}
 			}
 
 			// Q: What is the extra backup and why do we need to care about it?
-			if (extraBackup.isValid()) {
+			if (extraBackup.isValid()) { // SOMEDAY: Handle this case
 				TraceEvent("BARW_WaitExtraBackup", randomID).detail("BackupTag", printable(self->backupTag));
 				extraTasks = true;
 				try {
@@ -754,15 +608,6 @@ struct BackupAndParallelRestoreCorrectnessWorkload : TestWorkload {
 					TraceEvent("BARW_CheckLeftoverTasks", randomID).detail("BackupTag", printable(self->backupTag));
 					state int64_t taskCount = wait(backupAgent.getTaskCount(tr));
 					state int waitCycles = 0;
-
-					if ((taskCount) && (0)) {
-						TraceEvent("BARW_EndingNonzeroTaskCount", randomID)
-						    .detail("BackupTag", printable(self->backupTag))
-						    .detail("TaskCount", taskCount)
-						    .detail("WaitCycles", waitCycles);
-						printf("EndingNonZeroTasks: %ld\n", (long)taskCount);
-						wait(TaskBucket::debugPrintRange(cx, LiteralStringRef("\xff"), StringRef()));
-					}
 
 					loop {
 						waitCycles++;
@@ -871,7 +716,7 @@ struct BackupAndParallelRestoreCorrectnessWorkload : TestWorkload {
 				g_simulator.backupAgents = ISimulator::NoBackupAgents;
 			}
 		} catch (Error& e) {
-			TraceEvent(SevError, "BackupAndRestoreCorrectness").error(e).GetLastError();
+			TraceEvent(SevError, "BackupAndParallelRestoreCorrectness").error(e).GetLastError();
 			throw;
 		}
 		return Void();

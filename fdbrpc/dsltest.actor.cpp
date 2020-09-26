@@ -262,14 +262,20 @@ ACTOR template <class A, class B>
 class TestBuffer : public ReferenceCounted<TestBuffer> {
 public:
 	static TestBuffer* create( int length ) {
+#if defined(__INTEL_COMPILER)
+		return new TestBuffer(length);
+#else
 		auto b = (TestBuffer*)new int[ (length+7)/4 ];
 		new (b) TestBuffer(length);
 		return b;
+#endif
 	}
+#if !defined(__INTEL_COMPILER)
 	void operator delete( void* buf ) {
 		cout << "Freeing buffer" << endl;
 		delete[] (int*)buf;
 	}
+#endif
 
 	int size() const { return length; }
 	uint8_t* begin() { return data; }
@@ -278,7 +284,7 @@ public:
 	const uint8_t* end() const { return data+length; }
 
 private:
-	TestBuffer(int length) throw () : length(length) {}
+	TestBuffer(int length) noexcept : length(length) {}
 	int length;
 	uint8_t data[1];
 };
@@ -1051,8 +1057,8 @@ void sleeptest() {
 			timespec ts;
 			ts.tv_sec = times[j] / 1000000;
 			ts.tv_nsec = (times[j] % 1000000)*1000;
-			clock_nanosleep(CLOCK_MONOTONIC, 0, &ts, NULL);
-			//nanosleep(&ts, NULL);
+			clock_nanosleep(CLOCK_MONOTONIC, 0, &ts, nullptr);
+			//nanosleep(&ts, nullptr);
 		}
 		double t = timer() - b;
 		printf("Sleep test (%dus x %d): %0.1f\n", times[j], n, double(t)/n*1e6);

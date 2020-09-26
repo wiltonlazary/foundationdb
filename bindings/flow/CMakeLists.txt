@@ -16,8 +16,14 @@ set(SRCS
   fdb_flow.actor.cpp
   fdb_flow.h)
 
-add_flow_target(NAME fdb_flow SRCS ${SRCS} STATIC_LIBRARY)
+add_flow_target(STATIC_LIBRARY NAME fdb_flow SRCS ${SRCS})
 target_link_libraries(fdb_flow PUBLIC fdb_c)
+target_include_directories(fdb_flow PUBLIC
+  "${CMAKE_CURRENT_BINARY_DIR}"
+  "${CMAKE_CURRENT_SOURCE_DIR}"
+  "${CMAKE_CURRENT_SOURCE_DIR}/tester"
+  "${CMAKE_CURRENT_BINARY_DIR}/tester"
+  )
 
 add_subdirectory(tester)
 
@@ -29,10 +35,16 @@ if(NOT OPEN_FOR_IDE)
     endif()
   endforeach()
 
+  if(NOT FDB_RELEASE)
+    set(prerelease_string "-PRERELEASE")
+  else()
+    set(prerelease_string "")
+  endif()
+
   file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/packages)
   file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/packages)
   set(package_dir ${CMAKE_CURRENT_BINARY_DIR}/packages/fdb-flow-${CMAKE_PROJECT_VERSION})
-  set(tar_file ${CMAKE_BINARY_DIR}/packages/fdb-flow-${CMAKE_PROJECT_VERSION}.tar.gz)
+  set(tar_file ${CMAKE_BINARY_DIR}/packages/fdb-flow-${CMAKE_PROJECT_VERSION}${prerelease_string}-x86_64.tar.gz)
   add_custom_command(OUTPUT ${tar_file}
     COMMAND
     ${CMAKE_COMMAND} -E make_directory ${package_dir} &&

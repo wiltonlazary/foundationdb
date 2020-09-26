@@ -27,8 +27,6 @@
 
 class ClientKnobs : public Knobs {
 public:
-	int BYTE_LIMIT_UNLIMITED;
-	int ROW_LIMIT_UNLIMITED;
 
 	int TOO_MANY; // FIXME: this should really be split up so we can control these more specifically
 
@@ -40,11 +38,17 @@ public:
 	double CLIENT_FAILURE_TIMEOUT_DELAY;
 	double FAILURE_EMERGENCY_DELAY;
 	double FAILURE_MAX_GENERATIONS;
+	double RECOVERY_DELAY_START_GENERATION;
+	double RECOVERY_DELAY_SECONDS_PER_GENERATION;
+	double MAX_GENERATIONS;
+	double MAX_GENERATIONS_OVERRIDE;
 
 	double COORDINATOR_RECONNECTION_DELAY;
 	int CLIENT_EXAMPLE_AMOUNT;
 	double MAX_CLIENT_STATUS_AGE;
-	int MAX_CLIENT_PROXY_CONNECTIONS;
+	int MAX_COMMIT_PROXY_CONNECTIONS;
+	int MAX_GRV_PROXY_CONNECTIONS;
+	double STATUS_IDLE_TIMEOUT;
 
 	// wrong_shard_server sometimes comes from the only nonfailed server, so we need to avoid a fast spin
 	double WRONG_SHARD_SERVER_DELAY; // SOMEDAY: This delay can limit performance of retrieving data when the cache is mostly wrong (e.g. dumping the database after a test)
@@ -55,6 +59,8 @@ public:
 	double BACKOFF_GROWTH_RATE;
 	double RESOURCE_CONSTRAINED_MAX_BACKOFF;
 	int PROXY_COMMIT_OVERHEAD_BYTES;
+	double SHARD_STAT_SMOOTH_AMOUNT;
+	int INIT_MID_SHARD_BYTES;
 
 	int TRANSACTION_SIZE_LIMIT;
 	int64_t KEY_SIZE_LIMIT;
@@ -66,6 +72,7 @@ public:
 	int MAX_BATCH_SIZE;
 	double GRV_BATCH_TIMEOUT;
 	int BROADCAST_BATCH_SIZE;
+	double TRANSACTION_TIMEOUT_DELAY_INTERVAL;
 
 	// When locationCache in DatabaseContext gets to be this size, items will be evicted
 	int LOCATION_CACHE_EVICTION_SIZE;
@@ -74,10 +81,13 @@ public:
 	int GET_RANGE_SHARD_LIMIT;
 	int WARM_RANGE_SHARD_LIMIT;
 	int STORAGE_METRICS_SHARD_LIMIT;
+	int SHARD_COUNT_LIMIT;
 	double STORAGE_METRICS_UNFAIR_SPLIT_LIMIT;
 	double STORAGE_METRICS_TOO_MANY_SHARDS_DELAY;
 	double AGGREGATE_HEALTH_METRICS_MAX_STALENESS;
 	double DETAILED_HEALTH_METRICS_MAX_STALENESS;
+	double MID_SHARD_SIZE_MAX_STALENESS;
+	bool TAG_ENCODE_KEY_SERVERS;
 
 	//KeyRangeMap
 	int KRM_GET_RANGE_LIMIT;
@@ -99,6 +109,7 @@ public:
 	int MUTATION_BLOCK_SIZE;
 
 	// Taskbucket
+	double TASKBUCKET_LOGGING_DELAY;
 	int TASKBUCKET_MAX_PRIORITY;
 	double TASKBUCKET_CHECK_TIMEOUT_CHANCE;
 	double TASKBUCKET_TIMEOUT_JITTER_OFFSET;
@@ -130,7 +141,14 @@ public:
 	int BACKUP_MAP_KEY_UPPER_LIMIT;
 	int BACKUP_COPY_TASKS;
 	int BACKUP_BLOCK_SIZE;
+	int COPY_LOG_BLOCK_SIZE;
+	int COPY_LOG_BLOCKS_PER_TASK;
+	int COPY_LOG_PREFETCH_BLOCKS;
+	int COPY_LOG_READ_AHEAD_BYTES;
+	double COPY_LOG_TASK_DURATION_NANOS;
 	int BACKUP_TASKS_PER_AGENT;
+	int BACKUP_POLL_PROGRESS_SECONDS;
+	int64_t VERSIONS_PER_SECOND; // Copy of SERVER_KNOBS, as we can't link with it
 	int SIM_BACKUP_TASKS_PER_AGENT;
 	int BACKUP_RANGEFILE_BLOCK_SIZE;
 	int BACKUP_LOGFILE_BLOCK_SIZE;
@@ -149,7 +167,10 @@ public:
 	double MIN_CLEANUP_SECONDS;
 
 	// Configuration
-	int32_t DEFAULT_AUTO_PROXIES;
+	int32_t DEFAULT_AUTO_COMMIT_PROXIES;
+	int32_t DEFAULT_AUTO_GRV_PROXIES;
+	int32_t DEFAULT_COMMIT_GRV_PROXIES_RATIO;
+	int32_t DEFAULT_MAX_GRV_PROXIES;
 	int32_t DEFAULT_AUTO_RESOLVERS;
 	int32_t DEFAULT_AUTO_LOGS;
 
@@ -166,7 +187,7 @@ public:
 	int BLOBSTORE_CONNECT_TIMEOUT;
 	int BLOBSTORE_MAX_CONNECTION_LIFE;
 	int BLOBSTORE_REQUEST_TRIES;
-	int BLOBSTORE_REQUEST_TIMEOUT;
+	int BLOBSTORE_REQUEST_TIMEOUT_MIN;
 	int BLOBSTORE_REQUESTS_PER_SECOND;
 	int BLOBSTORE_LIST_REQUESTS_PER_SECOND;
 	int BLOBSTORE_WRITE_REQUESTS_PER_SECOND;
@@ -188,7 +209,26 @@ public:
 	int CONSISTENCY_CHECK_RATE_LIMIT_MAX;
 	int CONSISTENCY_CHECK_ONE_ROUND_TARGET_COMPLETION_TIME;
 
-	ClientKnobs(bool randomize = false);
+	// fdbcli
+	int CLI_CONNECT_PARALLELISM;
+	double CLI_CONNECT_TIMEOUT;
+
+	// trace
+	int TRACE_LOG_FILE_IDENTIFIER_MAX_LENGTH;
+
+	// transaction tags
+	int MAX_TRANSACTION_TAG_LENGTH;
+	int MAX_TAGS_PER_TRANSACTION;
+	int COMMIT_SAMPLE_COST; // The expectation of sampling is every COMMIT_SAMPLE_COST sample once
+	int WRITE_COST_BYTE_FACTOR;
+	int INCOMPLETE_SHARD_PLUS; // The size of (possible) incomplete shard when estimate clear range
+	double READ_TAG_SAMPLE_RATE; // Communicated to clients from cluster
+	double TAG_THROTTLE_SMOOTHING_WINDOW;
+	double TAG_THROTTLE_RECHECK_INTERVAL;
+	double TAG_THROTTLE_EXPIRATION_INTERVAL;
+
+	ClientKnobs();
+	void initialize(bool randomize = false);
 };
 
 extern ClientKnobs const* CLIENT_KNOBS;

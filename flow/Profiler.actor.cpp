@@ -36,7 +36,7 @@
 
 extern volatile thread_local int profilingEnabled;
 
-static uint64_t gettid() { return syscall(__NR_gettid); }
+static uint64_t sys_gettid() { return syscall(__NR_gettid); }
 
 struct SignalClosure {
 	void (* func)(int, siginfo_t*, void*, void*);
@@ -163,7 +163,7 @@ struct Profiler {
 	}
 
 	void enableSignal(bool enabled) {
-		sigprocmask( enabled?SIG_UNBLOCK:SIG_BLOCK, &profilingSignals, NULL );
+		sigprocmask( enabled?SIG_UNBLOCK:SIG_BLOCK, &profilingSignals, nullptr );
 	}
 
 	void phdr( struct dl_phdr_info* info ) {
@@ -216,7 +216,7 @@ struct Profiler {
 		act.sa_sigaction = SignalClosure::signal_handler;
 		sigemptyset(&act.sa_mask);
 		act.sa_flags = SA_SIGINFO;
-		sigaction( SIGPROF, &act, NULL );
+		sigaction( SIGPROF, &act, nullptr );
 
 		// Set up periodic profiling timer
 		int period_ns = period * 1000;
@@ -230,13 +230,13 @@ struct Profiler {
 		sev.sigev_notify = SIGEV_THREAD_ID;
 		sev.sigev_signo = SIGPROF;
 		sev.sigev_value.sival_ptr = &(self->signalClosure);
-		sev._sigev_un._tid = gettid();
+		sev._sigev_un._tid = sys_gettid();
 		if(timer_create( CLOCK_THREAD_CPUTIME_ID, &sev, &self->periodicTimer ) != 0) {
 			TraceEvent(SevWarn, "FailedToCreateProfilingTimer").GetLastError();
 			return Void();
 		}
 		self->timerInitialized = true;
-		if(timer_settime( self->periodicTimer, 0, &tv, NULL ) != 0) {
+		if(timer_settime( self->periodicTimer, 0, &tv, nullptr ) != 0) {
 			TraceEvent(SevWarn, "FailedToSetProfilingTimer").GetLastError();
 			return Void();
 		}
@@ -284,7 +284,7 @@ void startProfiling(INetwork* network, Optional<int> maybePeriod /*= {}*/, Optio
 		const char* outfn = getenv("FLOW_PROFILER_OUTPUT");
 		outputFile = (outfn ? outfn : "profile.bin");
 	}
-	outputFile = findAndReplace(findAndReplace(findAndReplace(outputFile, "%ADDRESS%", findAndReplace(network->getLocalAddress().toString(), ":", ".")), "%PID%", format("%d", getpid())), "%TID%", format("%llx", (long long)gettid()));
+	outputFile = findAndReplace(findAndReplace(findAndReplace(outputFile, "%ADDRESS%", findAndReplace(network->getLocalAddress().toString(), ":", ".")), "%PID%", format("%d", getpid())), "%TID%", format("%llx", (long long)sys_gettid()));
 
 	if (!Profiler::active_profiler)
 		Profiler::active_profiler = new Profiler( period, outputFile, network );

@@ -32,13 +32,15 @@ struct MutationListRef {
 	// Each blob has a struct Header following by the mutation's param1 and param2 content.
 	// The Header has the mutation's type and the length of param1 and param2
 
-private:
+public:
 	struct Blob {
 		// StringRef data Format: |type|p1len|p2len|p1_content|p2_content|
 		// |type|p1len|p2len| is the header; p1_content has p1len length; p2_content has p2len length
 		StringRef data;
 		Blob* next;
 	};
+	Blob *blob_begin;
+private:
 	struct Header {
 		int type, p1len, p2len;
 		const uint8_t* p1begin() const {
@@ -60,7 +62,7 @@ public:
 			auto e = ptr->end(); // e points to the end of the current blob
 			if (e == blob->data.end()) { // the condition sanity checks e is at the end of current blob
 				blob = blob->next;
-				e = blob ? blob->data.begin() : NULL;
+				e = blob ? blob->data.begin() : nullptr;
 			}
 			ptr = (Header*)e;
 			decode();
@@ -68,7 +70,7 @@ public:
 
 		bool operator == ( Iterator const& i ) const { return ptr == i.ptr; }
 		bool operator != ( Iterator const& i) const { return ptr != i.ptr; }
-		explicit operator bool() const { return blob!=NULL; }
+		explicit operator bool() const { return blob!=nullptr; }
 
 		typedef std::forward_iterator_tag iterator_category;
 		typedef const MutationRef value_type;
@@ -77,7 +79,7 @@ public:
 		typedef const MutationRef& reference;
 
 		Iterator( Blob* blob, const Header* ptr ) : blob(blob), ptr(ptr) { decode(); }
-		Iterator() : blob(NULL), ptr(NULL) { }
+		Iterator() : blob(nullptr), ptr(nullptr) { }
 	private:
 		friend struct MutationListRef;
 		const Blob* blob;  // The blob containing the indicated mutation
@@ -93,16 +95,16 @@ public:
 		}
 	};
 
-	MutationListRef() : blob_begin(NULL), blob_end(NULL), totalBytes(0) {
+	MutationListRef() : blob_begin(nullptr), blob_end(nullptr), totalBytes(0) {
 	}
-	MutationListRef( Arena& ar, MutationListRef const& r ) : blob_begin(NULL), blob_end(NULL), totalBytes(0) {
+	MutationListRef( Arena& ar, MutationListRef const& r ) : blob_begin(nullptr), blob_end(nullptr), totalBytes(0) {
 		append_deep(ar, r.begin(), r.end());
 	}
 	Iterator begin() const {
 		if (blob_begin) return Iterator(blob_begin, (Header*)blob_begin->data.begin());
-		return Iterator(NULL, NULL);
+		return Iterator(nullptr, nullptr);
 	}
-	Iterator end() const { return Iterator(NULL, NULL); }
+	Iterator end() const { return Iterator(nullptr, nullptr); }
 	size_t expectedSize() const { return sizeof(Blob) + totalBytes; }
 	int totalSize() const { return totalBytes; }
 
@@ -144,10 +146,13 @@ public:
 
 		if(totalBytes > 0) {
 			blob_begin = blob_end = new (ar.arena()) Blob;
-			blob_begin->next = NULL;
+			blob_begin->next = nullptr;
 			blob_begin->data = StringRef((const uint8_t*)ar.arenaRead(totalBytes), totalBytes); // Zero-copy read when deserializing from an ArenaReader
 		}
 	}
+
+	// FIXME: this is re-implemented on the commit proxy to include a yield, any changes to this function should also
+	// done there
 	template <class Ar>
 	void serialize_save( Ar& ar ) const {
 		serializer(ar, totalBytes);
@@ -176,11 +181,11 @@ private:
 		}
 
 		blob_end->data = StringRef(b, bytes);
-		blob_end->next = NULL;
+		blob_end->next = nullptr;
 		return b;
 	}
 
-	Blob *blob_begin, *blob_end;
+	Blob *blob_end;
 	int totalBytes;
 };
 typedef Standalone<MutationListRef> MutationList;

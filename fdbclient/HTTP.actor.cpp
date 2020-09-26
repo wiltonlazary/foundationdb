@@ -72,7 +72,7 @@ namespace HTTP {
 	}
 
 	PacketBuffer * writeRequestHeader(std::string const &verb, std::string const &resource, HTTP::Headers const &headers, PacketBuffer *dest) {
-		PacketWriter writer(dest, NULL, Unversioned());
+		PacketWriter writer(dest, nullptr, Unversioned());
 		writer.serializeBytes(verb);
 		writer.serializeBytes(" ", 1);
 		writer.serializeBytes(resource);
@@ -91,10 +91,6 @@ namespace HTTP {
 	// Returns the number of bytes read.
 	ACTOR Future<int> read_into_string(Reference<IConnection> conn, std::string *buf, int maxlen) {
 		loop {
-			// Wait for connection to have something to read
-			wait(conn->onReadable());
-			wait( delay( 0, TaskPriority::ReadSocket ) );
-
 			// Read into buffer
 			int originalSize = buf->size();
 			// TODO:  resize is zero-initializing the space we're about to overwrite, so do something else, which probably means
@@ -107,6 +103,10 @@ namespace HTTP {
 			// Make sure data was actually read, it's possible for there to be none.
 			if(len > 0)
 				return len;
+
+			// Wait for connection to have something to read
+			wait(conn->onReadable());
+			wait( delay( 0, TaskPriority::ReadSocket ) );
 		}
 	}
 
@@ -238,7 +238,7 @@ namespace HTTP {
 				{
 					// Read the line that contains the chunk length as text in hex
 					size_t lineLen = wait(read_delimited_into_string(conn, "\r\n", &r->content, pos));
-					state int chunkLen = strtol(r->content.substr(pos, lineLen).c_str(), NULL, 16);
+					state int chunkLen = strtol(r->content.substr(pos, lineLen).c_str(), nullptr, 16);
 
 					// Instead of advancing pos, erase the chunk length header line (line length + delimiter size) from the content buffer
 					r->content.erase(pos, lineLen + 2);
@@ -301,7 +301,7 @@ namespace HTTP {
 		state TraceEvent event(SevDebug, "HTTPRequest");
 
 		state UnsentPacketQueue empty;
-		if(pContent == NULL)
+		if(pContent == nullptr)
 			pContent = &empty;
 
 		// There is no standard http request id header field, so either a global default can be set via a knob
@@ -352,9 +352,6 @@ namespace HTTP {
 			send_start = timer();
 
 			loop {
-				wait(conn->onWritable());
-				wait( delay( 0, TaskPriority::WriteSocket ) );
-
 				// If we already got a response, before finishing sending the request, then close the connection,
 				// set the Connection header to "close" as a hint to the caller that this connection can't be used
 				// again, and break out of the send loop.
@@ -375,6 +372,9 @@ namespace HTTP {
 				pContent->sent(len);
 				if(pContent->empty())
 					break;
+
+				wait(conn->onWritable());
+				wait(yield(TaskPriority::WriteSocket));
 			}
 
 			wait(responseReading);

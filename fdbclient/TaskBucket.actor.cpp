@@ -230,21 +230,21 @@ public:
 		return task;
 	}
 
-	// Verify that the user configured task verification key still has the user specificied value
+	// Verify that the user configured task verification key still has the user specified value
 	ACTOR static Future<bool> taskVerify(Reference<TaskBucket> tb, Reference<ReadYourWritesTransaction> tr, Reference<Task> task) {
 
 		if (task->params.find(Task::reservedTaskParamValidKey) == task->params.end()) {
-			TraceEvent("TB_TaskVerifyInvalidTask")
-				.detail("Task", task->params[Task::reservedTaskParamKeyType])
-				.detail("ReservedTaskParamValidKey", "missing");
+			TraceEvent("TaskBucketTaskVerifyInvalidTask")
+			    .detail("Task", task->params[Task::reservedTaskParamKeyType])
+			    .detail("ReservedTaskParamValidKey", "missing");
 			return false;
 		}
 
 		if (task->params.find(Task::reservedTaskParamValidValue) == task->params.end()) {
-			TraceEvent("TB_TaskVerifyInvalidTask")
-				.detail("Task", task->params[Task::reservedTaskParamKeyType])
-				.detail("ReservedTaskParamValidKey", task->params[Task::reservedTaskParamValidKey])
-				.detail("ReservedTaskParamValidValue", "missing");
+			TraceEvent("TaskBucketTaskVerifyInvalidTask")
+			    .detail("Task", task->params[Task::reservedTaskParamKeyType])
+			    .detail("ReservedTaskParamValidKey", task->params[Task::reservedTaskParamValidKey])
+			    .detail("ReservedTaskParamValidValue", "missing");
 			return false;
 		}
 
@@ -253,20 +253,20 @@ public:
 		Optional<Value> keyValue = wait(tr->get(task->params[Task::reservedTaskParamValidKey]));
 
 		if (!keyValue.present()) {
-			TraceEvent("TB_TaskVerifyInvalidTask")
-				.detail("Task", task->params[Task::reservedTaskParamKeyType])
-				.detail("ReservedTaskParamValidKey", task->params[Task::reservedTaskParamValidKey])
-				.detail("ReservedTaskParamValidValue", task->params[Task::reservedTaskParamValidValue])
-				.detail("KeyValue", "missing");
+			TraceEvent("TaskBucketTaskVerifyInvalidTask")
+			    .detail("Task", task->params[Task::reservedTaskParamKeyType])
+			    .detail("ReservedTaskParamValidKey", task->params[Task::reservedTaskParamValidKey])
+			    .detail("ReservedTaskParamValidValue", task->params[Task::reservedTaskParamValidValue])
+			    .detail("KeyValue", "missing");
 			return false;
 		}
 
 		if (keyValue.get().compare(StringRef(task->params[Task::reservedTaskParamValidValue]))) {
-			TraceEvent("TB_TaskVerifyAbortedTask")
-				.detail("Task", task->params[Task::reservedTaskParamKeyType])
-				.detail("ReservedTaskParamValidKey", task->params[Task::reservedTaskParamValidKey])
-				.detail("ReservedTaskParamValidValue", task->params[Task::reservedTaskParamValidValue])
-				.detail("KeyValue", keyValue.get());
+			TraceEvent("TaskBucketTaskVerifyAbortedTask")
+			    .detail("Task", task->params[Task::reservedTaskParamKeyType])
+			    .detail("ReservedTaskParamValidKey", task->params[Task::reservedTaskParamValidKey])
+			    .detail("ReservedTaskParamValidValue", task->params[Task::reservedTaskParamValidValue])
+			    .detail("KeyValue", keyValue.get());
 			return false;
 		}
 
@@ -316,6 +316,7 @@ public:
 	
 	ACTOR static Future<Void> extendTimeoutRepeatedly(Database cx, Reference<TaskBucket> taskBucket, Reference<Task> task) {
 		state Reference<ReadYourWritesTransaction> tr(new ReadYourWritesTransaction(cx));
+		state double start = now();
 		state Version versionNow = wait(runRYWTransaction(cx, [=](Reference<ReadYourWritesTransaction> tr) {
 			taskBucket->setOptions(tr);
 			return map(tr->getReadVersion(), [=](Version v) {
@@ -329,6 +330,13 @@ public:
 			// Wait until we are half way to the timeout version of this task
 			wait(delay(0.8 * (BUGGIFY ? (2 * deterministicRandom()->random01()) : 1.0) * (double)(task->timeoutVersion - (uint64_t)versionNow) / CLIENT_KNOBS->CORE_VERSIONSPERSECOND));
 
+			if(now() - start > 300) {
+				TraceEvent(SevWarnAlways, "TaskBucketLongExtend")
+				    .detail("Duration", now() - start)
+				    .detail("TaskUID", task->key)
+				    .detail("TaskType", task->params[Task::reservedTaskParamKeyType])
+				    .detail("Priority", task->getPriority());
+			}
 			// Take the extendMutex lock until we either succeed or stop trying to extend due to failure
 			wait(task->extendMutex.take());
 			releaser = FlowLock::Releaser(task->extendMutex, 1);
@@ -394,19 +402,19 @@ public:
 				}));
 			}
 		} catch(Error &e) {
-			TraceEvent(SevWarn, "TB_ExecuteFailure")
-				.error(e)
-				.detail("TaskUID", task->key)
-				.detail("TaskType", task->params[Task::reservedTaskParamKeyType].printable())
-				.detail("Priority", task->getPriority());
+			TraceEvent(SevWarn, "TaskBucketExecuteFailure")
+			    .error(e)
+			    .detail("TaskUID", task->key)
+			    .detail("TaskType", task->params[Task::reservedTaskParamKeyType].printable())
+			    .detail("Priority", task->getPriority());
 			try {
 				wait(taskFunc->handleError(cx, task, e));
 			} catch(Error &e) {
-				TraceEvent(SevWarn, "TB_ExecuteFailureLogErrorFailed")
-					.error(e) // output handleError() error instead of original task error
-					.detail("TaskUID", task->key.printable())
-					.detail("TaskType", task->params[Task::reservedTaskParamKeyType].printable())
-					.detail("Priority", task->getPriority());
+				TraceEvent(SevWarn, "TaskBucketExecuteFailureLogErrorFailed")
+				    .error(e) // output handleError() error instead of original task error
+				    .detail("TaskUID", task->key.printable())
+				    .detail("TaskType", task->params[Task::reservedTaskParamKeyType].printable())
+				    .detail("Priority", task->getPriority());
 			}
 		}
 
@@ -430,6 +438,7 @@ public:
 
 		loop {
 			// Start running tasks while slots are available and we keep finding work to do
+			++taskBucket->dispatchSlotChecksStarted;
 			while(!availableSlots.empty()) {
 				getTasks.clear();
 				for(int i = 0, imax = std::min<unsigned int>(getBatchSize, availableSlots.size()); i < imax; ++i)
@@ -439,18 +448,22 @@ public:
 				bool done = false;
 				for(int i = 0; i < getTasks.size(); ++i) {
 					if(getTasks[i].isError()) {
+						++taskBucket->dispatchErrors;
 						done = true;
 						continue;
 					}
 					Reference<Task> task = getTasks[i].get();
 					if(task) {
 						// Start the task
+						++taskBucket->dispatchDoTasks;
 						int slot = availableSlots.back();
 						availableSlots.pop_back();
 						tasks[slot] = taskBucket->doTask(cx, futureBucket, task);
 					}
-					else
+					else {
+						++taskBucket->dispatchEmptyTasks;
 						done = true;
+					}
 				}
 
 				if(done) {
@@ -460,11 +473,16 @@ public:
 				else
 					getBatchSize = std::min<unsigned int>(getBatchSize * 2, maxConcurrentTasks);
 			}
+			++taskBucket->dispatchSlotChecksComplete;
 			
 			// Wait for a task to be done.  Also, if we have any slots available then stop waiting after pollDelay at the latest.
 			Future<Void> w = ready(waitForAny(tasks));
-			if(!availableSlots.empty())
+			if(!availableSlots.empty()) {
+				if(*pollDelay > 600) {
+					TraceEvent(SevWarnAlways, "TaskBucketLongPollDelay").suppressFor(1.0).detail("Delay", *pollDelay);
+				}
 				w = w || delay(*pollDelay * (0.9 + deterministicRandom()->random01() / 5));   // Jittered by 20 %, so +/- 10%
+			}
 			wait(w);
 
 			// Check all of the task slots, any that are finished should be replaced with Never() and their slots added back to availableSlots
@@ -497,7 +515,7 @@ public:
 	ACTOR static Future<Void> run(Database cx, Reference<TaskBucket> taskBucket, Reference<FutureBucket> futureBucket, double *pollDelay, int maxConcurrentTasks) {
 		state Reference<AsyncVar<bool>> paused = Reference<AsyncVar<bool>>( new AsyncVar<bool>(true) );
 		state Future<Void> watchPausedFuture = watchPaused(cx, taskBucket, paused);
-
+		taskBucket->metricLogger = traceCounters("TaskBucketMetrics", taskBucket->dbgid, CLIENT_KNOBS->TASKBUCKET_LOGGING_DELAY, &taskBucket->cc);
 		loop {
 			while(paused->get()) {
 				wait(paused->onChange() || watchPausedFuture);
@@ -709,14 +727,17 @@ public:
 		tr->setOption(FDBTransactionOptions::ACCESS_SYSTEM_KEYS);
 		tr->setOption(FDBTransactionOptions::LOCK_AWARE);
 		Standalone<RangeResultRef> values = wait(tr->getRange(subspace.range(), CLIENT_KNOBS->TOO_MANY));
-		TraceEvent("TaskBucket").detail("DebugPrintRange", "Print DB Range").detail("Key", subspace.key()).detail("Count", values.size()).detail("Msg", msg);
-		
+		TraceEvent("TaskBucketDebugPrintRange")
+		    .detail("Key", subspace.key())
+		    .detail("Count", values.size())
+		    .detail("Msg", msg);
+
 		/*printf("debugPrintRange  key: (%d) %s\n", values.size(), printable(subspace.key()).c_str());
 		for (auto & s : values) {
-			printf("   key: %-40s   value: %s\n", printable(s.key).c_str(), s.value.c_str());
-			TraceEvent("TaskBucket").detail("DebugPrintRange", msg)
-				.detail("Key", s.key)
-				.detail("Value", s.value);
+		    printf("   key: %-40s   value: %s\n", printable(s.key).c_str(), s.value.c_str());
+		    TraceEvent("TaskBucketDebugPrintKV").detail("Msg", msg)
+		        .detail("Key", s.key)
+		        .detail("Value", s.value);
 		}*/
 
 		return Void();
@@ -783,6 +804,13 @@ TaskBucket::TaskBucket(const Subspace& subspace, bool sysAccess, bool priorityBa
 	, system_access(sysAccess)
 	, priority_batch(priorityBatch)
 	, lock_aware(lockAware)
+	, cc("TaskBucket")
+	, dbgid( deterministicRandom()->randomUniqueID() )
+	, dispatchSlotChecksStarted("DispatchSlotChecksStarted", cc)
+	, dispatchErrors("DispatchErrors", cc)
+	, dispatchDoTasks("DispatchDoTasks", cc)
+	, dispatchEmptyTasks("DispatchEmptyTasks", cc)
+	, dispatchSlotChecksComplete("DispatchSlotChecksComplete", cc)
 {
 }
 
@@ -845,9 +873,9 @@ ACTOR static Future<Key> actorAddTask(TaskBucket* tb, Reference<ReadYourWritesTr
 	Optional<Value> validationValue = wait(tr->get(validationKey));
 
 	if (!validationValue.present()) {
-		TraceEvent(SevError, "TB_AddTaskInvalidKey")
-			.detail("Task", task->params[Task::reservedTaskParamKeyType])
-			.detail("ValidationKey", validationKey);
+		TraceEvent(SevError, "TaskBucketAddTaskInvalidKey")
+		    .detail("Task", task->params[Task::reservedTaskParamKeyType])
+		    .detail("ValidationKey", validationKey);
 		throw invalid_option_value();
 	}
 
@@ -1113,9 +1141,9 @@ public:
 		Optional<Value> validationValue = wait(tr->get(validationKey));
 
 		if (!validationValue.present()) {
-			TraceEvent(SevError, "TB_OnSetAddTaskInvalidKey")
-				.detail("Task", task->params[Task::reservedTaskParamKeyType])
-				.detail("ValidationKey", validationKey);
+			TraceEvent(SevError, "TaskBucketOnSetAddTaskInvalidKey")
+			    .detail("Task", task->params[Task::reservedTaskParamKeyType])
+			    .detail("ValidationKey", validationKey);
 			throw invalid_option_value();
 		}
 
@@ -1214,6 +1242,6 @@ ACTOR Future<Key> getCompletionKey(TaskCompletionKey *self, Future<Reference<Tas
 }
 
 Future<Key> TaskCompletionKey::get(Reference<ReadYourWritesTransaction> tr, Reference<TaskBucket> taskBucket) {
-	ASSERT(key.present() == (joinFuture.getPtr() == NULL));
+	ASSERT(key.present() == (joinFuture.getPtr() == nullptr));
 	return key.present() ? key.get() : getCompletionKey(this, joinFuture->joinedFuture(tr, taskBucket));
 }

@@ -126,9 +126,10 @@ struct UnreadableWorkload : TestWorkload {
 		key.setKey(it->first);
 	}
 
-	static void checkUnreadablity(Arena arena, std::map<KeyRef, ValueRef> const& setMap, KeyRangeMap<bool> & unreadableMap,
-		KeySelectorRef const& _begin, KeySelectorRef const& _end, bool isUnreadable, int limit, bool reverse) {
-		
+	static void checkUnreadability(std::map<KeyRef, ValueRef> const& setMap, KeyRangeMap<bool>& unreadableMap,
+	                               KeySelectorRef const& _begin, KeySelectorRef const& _end, bool isUnreadable,
+	                               int limit, bool reverse) {
+
 		/*
 		for (auto it : setMap) {
 			TraceEvent("RYWT_SetMapContents").detail("Key", printable(it.first));
@@ -344,7 +345,7 @@ struct UnreadableWorkload : TestWorkload {
 					key = RandomTestImpl::getRandomVersionstampKey(arena);
 					value = RandomTestImpl::getRandomValue(arena);
 					tr.atomicOp(key, value, MutationRef::SetVersionstampedKey);
-					range = getVersionstampKeyRange(arena, key, allKeys.end);
+					range = getVersionstampKeyRange(arena, key, tr.getCachedReadVersion().orDefault(0), allKeys.end);
 					unreadableMap.insert(range, true);
 					//TraceEvent("RYWT_SetVersionstampKey").detail("Range", printable(range));
 				}
@@ -412,7 +413,7 @@ struct UnreadableWorkload : TestWorkload {
 							ASSERT(!isUnreadable);
 						}
 						else {
-							checkUnreadablity(arena, setMap, unreadableMap, begin, end, isUnreadable, limit, reverse);
+							checkUnreadability(setMap, unreadableMap, begin, end, isUnreadable, limit, reverse);
 						}
 					}
 					else {

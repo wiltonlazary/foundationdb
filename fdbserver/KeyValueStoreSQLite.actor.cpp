@@ -20,7 +20,7 @@
 
 
 #define SQLITE_THREADSAFE 0  // also in sqlite3.amalgamation.c!
-#include "fdbrpc/crc32c.h"
+#include "flow/crc32c.h"
 #include "fdbserver/IKeyValueStore.h"
 #include "fdbserver/CoroFlow.h"
 #include "fdbserver/Knobs.h"
@@ -46,7 +46,7 @@ void hexdump(FILE *fout, StringRef val);
 #include <Windows.h>*/
 
 /*uint64_t getFileSize( const char* filename ) {
-	HANDLE f = CreateFile( filename, GENERIC_READ, FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE, NULL, OPEN_EXISTING, 0, NULL);
+	HANDLE f = CreateFile( filename, GENERIC_READ, FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0, nullptr);
 	if (f == INVALID_HANDLE_VALUE) return 0;
 	DWORD hi,lo;
 	lo = GetFileSize(f, &hi);
@@ -165,12 +165,12 @@ struct PageChecksumCodec {
 						.detail("Filename", self->filename)
 						.detail("PageNumber", pageNumber);
 
-				return NULL;
+				return nullptr;
 			}
 		}
 
 		if(!self->checksum(pageNumber, data, self->pageSize, write))
-			return NULL;
+			return nullptr;
 
 		return data;
 	}
@@ -211,7 +211,7 @@ struct SQLiteDB : NonCopyable {
 	void open(bool writable);
 	void createFromScratch();
 
-	SQLiteDB( std::string filename, bool page_checksums, bool fragment_values): filename(filename), db(NULL), btree(NULL), table(-1), freetable(-1), haveMutex(false), page_checksums(page_checksums), fragment_values(fragment_values) {}
+	SQLiteDB( std::string filename, bool page_checksums, bool fragment_values): filename(filename), db(nullptr), btree(nullptr), table(-1), freetable(-1), haveMutex(false), page_checksums(page_checksums), fragment_values(fragment_values) {}
 
 	~SQLiteDB() {
 		if (db) {
@@ -315,9 +315,9 @@ class Statement : NonCopyable {
 
 public:
 	Statement( SQLiteDB& db, const char* sql )
-		: db(db), stmt(NULL)
+		: db(db), stmt(nullptr)
 	{
-		db.checkError("prepare", sqlite3_prepare_v2( db.db, sql, -1, &stmt, NULL));
+		db.checkError("prepare", sqlite3_prepare_v2( db.db, sql, -1, &stmt, nullptr));
 	}
 	~Statement() {
 		try {
@@ -428,15 +428,16 @@ Value encodeKVFragment( KeyValueRef kv, uint32_t index) {
 	// a signed representation of the index value.  The type code for 0 is 0 (which is
 	// actually the null type in SQLite).
 	int8_t indexCode = 0;
-	uint32_t tmp = index;
-	while(tmp != 0) {
-		++indexCode;
-		tmp >>= 8;
+	if (index != 0) {
+		uint32_t tmp = index;
+		while (tmp != 0) {
+			++indexCode;
+			tmp >>= 8;
+		}
+		// An increment is required if the high bit of the N-byte index value is set, since it is
+		// positive number but SQLite only stores signed values and would interpret it as negative.
+		if (index >> (8 * indexCode - 1)) ++indexCode;
 	}
-	// An increment is required if the high bit of the N-byte index value is set, since it is
-	// positive number but SQLite only stores signed values and would interpret it as negative.
-	if(index >> (8 * indexCode - 1))
-		++indexCode;
 
 	int header_size = sqlite3VarintLen(keyCode) + sizeof(indexCode) + sqlite3VarintLen(valCode);
 	int hh = sqlite3VarintLen(header_size);
@@ -519,7 +520,7 @@ int getEncodedKVFragmentSize( int keySize, int valuePrefixSize ) {
 // the full key and index were in the encoded buffer.  The value returned will be 0 or
 // more value bytes, however many were available.
 // Note that a short encoded buffer must at *least* contain the header length varint.
-Optional<KeyValueRef> decodeKVFragment( StringRef encoded, uint32_t *index = NULL, bool partial = false) {
+Optional<KeyValueRef> decodeKVFragment( StringRef encoded, uint32_t *index = nullptr, bool partial = false) {
 	uint8_t const* d = encoded.begin();
 	uint64_t h, len1, len2;
 	d += sqlite3GetVarint( d, (u64*)&h );
@@ -633,7 +634,7 @@ struct IntKeyCursor {
 	IntKeyCursor( SQLiteDB& db, int table, bool write ) : cursor(0), db(db) {
 		cursor = (BtCursor*)new char[sqlite3BtreeCursorSize()];
 		sqlite3BtreeCursorZero(cursor);
-		db.checkError("BtreeCursor", sqlite3BtreeCursor(db.btree, table, write, NULL, cursor));
+		db.checkError("BtreeCursor", sqlite3BtreeCursor(db.btree, table, write, nullptr, cursor));
 	}
 	~IntKeyCursor() {
 		if (cursor) {
@@ -725,7 +726,7 @@ struct RawCursor {
 	}
 	void insertFragment( KeyValueRef kv, uint32_t index, int seekResult ) {
 		Value v = encodeKVFragment(kv, index);
-		db.checkError("BtreeInsert", sqlite3BtreeInsert(cursor, v.begin(), v.size(), NULL, 0, 0, 0, seekResult));
+		db.checkError("BtreeInsert", sqlite3BtreeInsert(cursor, v.begin(), v.size(), nullptr, 0, 0, 0, seekResult));
 	}
 	void remove() {
 		db.checkError("BtreeDelete", sqlite3BtreeDelete(cursor));
@@ -822,7 +823,7 @@ struct RawCursor {
 			int r = moveTo( kv.key );
 			if (!r) remove();
 			Value v = encode(kv);
-			db.checkError("BTreeInsert", sqlite3BtreeInsert(cursor, v.begin(), v.size(), NULL, 0, 0, 0, r));
+			db.checkError("BTreeInsert", sqlite3BtreeInsert(cursor, v.begin(), v.size(), nullptr, 0, 0, 0, r));
 		}
 	}
 	void clearOne( KeyRangeRef keys ) {
@@ -1075,21 +1076,26 @@ struct RawCursor {
 		}
 		return Optional<Value>();
 	}
-	Standalone<VectorRef<KeyValueRef>> getRange( KeyRangeRef keys, int rowLimit, int byteLimit ) {
-		Standalone<VectorRef<KeyValueRef>> result;
+	Standalone<RangeResultRef> getRange( KeyRangeRef keys, int rowLimit, int byteLimit ) {
+		Standalone<RangeResultRef> result;
 		int accumulatedBytes = 0;
 		ASSERT( byteLimit > 0 );
+		if(rowLimit == 0) {
+			return result;
+		}
+
 		if(db.fragment_values) {
-			if(rowLimit >= 0) {
+			if(rowLimit > 0) {
 				int r = moveTo(keys.begin);
 				if (r < 0)
 					moveNext();
 
 				DefragmentingReader i(*this, result.arena(), true);
 				Optional<KeyRef> nextKey = i.peek();
-				while(nextKey.present() && nextKey.get() < keys.end && rowLimit-- && accumulatedBytes < byteLimit) {
+				while(nextKey.present() && nextKey.get() < keys.end && rowLimit != 0 && accumulatedBytes < byteLimit) {
 					Optional<KeyValueRef> kv = i.getNext();
 					result.push_back(result.arena(), kv.get());
+					--rowLimit;
 					accumulatedBytes += sizeof(KeyValueRef) + kv.get().expectedSize();
 					nextKey = i.peek();
 				}
@@ -1100,36 +1106,44 @@ struct RawCursor {
 					movePrevious();
 				DefragmentingReader i(*this, result.arena(), false);
 				Optional<KeyRef> nextKey = i.peek();
-				while(nextKey.present() && nextKey.get() >= keys.begin && rowLimit++ && accumulatedBytes < byteLimit) {
+				while(nextKey.present() && nextKey.get() >= keys.begin && rowLimit != 0 && accumulatedBytes < byteLimit) {
 					Optional<KeyValueRef> kv = i.getNext();
 					result.push_back(result.arena(), kv.get());
+					++rowLimit;
 					accumulatedBytes += sizeof(KeyValueRef) + kv.get().expectedSize();
 					nextKey = i.peek();
 				}
 			}
 		}
 		else {
-			if (rowLimit >= 0) {
+			if (rowLimit > 0) {
 				int r = moveTo( keys.begin );
 				if (r < 0) moveNext();
-				while (this->valid && rowLimit-- && accumulatedBytes < byteLimit) {
+				while (this->valid && rowLimit != 0 && accumulatedBytes < byteLimit) {
 					KeyValueRef kv = decodeKV( getEncodedRow( result.arena() ) );
-					accumulatedBytes += sizeof(KeyValueRef) + kv.expectedSize();
 					if (kv.key >= keys.end) break;
+					--rowLimit;
+					accumulatedBytes += sizeof(KeyValueRef) + kv.expectedSize();
 					result.push_back( result.arena(), kv );
 					moveNext();
 				}
 			} else {
 				int r = moveTo( keys.end );
 				if (r >= 0) movePrevious();
-				while (this->valid && rowLimit++ && accumulatedBytes < byteLimit) {
+				while (this->valid && rowLimit != 0 && accumulatedBytes < byteLimit) {
 					KeyValueRef kv = decodeKV( getEncodedRow( result.arena() ) );
-					accumulatedBytes += sizeof(KeyValueRef) + kv.expectedSize();
 					if (kv.key < keys.begin) break;
+					++rowLimit;
+					accumulatedBytes += sizeof(KeyValueRef) + kv.expectedSize();
 					result.push_back( result.arena(), kv );
 					movePrevious();
 				}
 			}
+		}
+		result.more = rowLimit == 0 || accumulatedBytes >= byteLimit;
+		if(result.more) {
+			ASSERT(result.size() > 0);
+			result.readThrough = result[result.size()-1].key;
 		}
 		return result;
 	}
@@ -1144,7 +1158,7 @@ struct RawCursor {
 		// Set field 1 of tuple to key, which is a string type with typecode 12 + 2*len
 		tupleValues[0].db = keyInfo.db;
 		tupleValues[0].enc = keyInfo.enc;
-		tupleValues[0].zMalloc = NULL;
+		tupleValues[0].zMalloc = nullptr;
 		ASSERT(sqlite3VdbeSerialGet(key.begin(), 12 + (2 * key.size()), &tupleValues[0]) == key.size());
 
 		// In fragmenting mode, seek is to (k, 0, ), otherwise just (k, ).
@@ -1154,8 +1168,8 @@ struct RawCursor {
 			// Set field 2 of tuple to the null type which is typecode 0
 			tupleValues[1].db = keyInfo.db;
 			tupleValues[1].enc = keyInfo.enc;
-			tupleValues[1].zMalloc = NULL;
-			ASSERT(sqlite3VdbeSerialGet(NULL, 0, &tupleValues[1]) == 0);
+			tupleValues[1].zMalloc = nullptr;
+			ASSERT(sqlite3VdbeSerialGet(nullptr, 0, &tupleValues[1]) == 0);
 
 			r.nField = 2;
 		}
@@ -1217,7 +1231,7 @@ int SQLiteDB::checkAllPageChecksums() {
 	// Now that the file itself is open and locked, let sqlite open the database
 	// Note that VFSAsync will also call g_network->open (including for the WAL), so its flags are important, too
 	// TODO:  If better performance is needed, make AsyncFileReadAheadCache work and be enabled by SQLITE_OPEN_READAHEAD which was added for that purpose.
-	int result = sqlite3_open_v2(apath.c_str(), &db, SQLITE_OPEN_READONLY, NULL);
+	int result = sqlite3_open_v2(apath.c_str(), &db, SQLITE_OPEN_READONLY, nullptr);
 	checkError("open", result);
 
 	// This check has the useful side effect of actually opening/reading the database.  If we were not doing this,
@@ -1336,7 +1350,7 @@ void SQLiteDB::open(bool writable) {
 
 	// Now that the file itself is open and locked, let sqlite open the database
 	// Note that VFSAsync will also call g_network->open (including for the WAL), so its flags are important, too
-	int result = sqlite3_open_v2(apath.c_str(), &db, (writable ? SQLITE_OPEN_READWRITE : SQLITE_OPEN_READONLY), NULL);
+	int result = sqlite3_open_v2(apath.c_str(), &db, (writable ? SQLITE_OPEN_READWRITE : SQLITE_OPEN_READONLY), nullptr);
 	checkError("open", result);
 
 	int chunkSize;
@@ -1386,7 +1400,7 @@ void SQLiteDB::open(bool writable) {
 
 void SQLiteDB::createFromScratch() {
 	int sqliteFlags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE;
-	checkError("open", sqlite3_open_v2(filename.c_str(), &db, sqliteFlags, NULL));
+	checkError("open", sqlite3_open_v2(filename.c_str(), &db, sqliteFlags, nullptr));
 
 	Statement(*this, "PRAGMA page_size = 4096").nextRow(); //fast
 	btree = db->aDb[0].pBt;
@@ -1426,31 +1440,28 @@ struct ThreadSafeCounter {
 	ThreadSafeCounter() : counter(0) {}
 	void operator ++() { interlockedIncrement64(&counter); }
 	void operator --() { interlockedDecrement64(&counter); }
-	operator const int64_t() const { return counter; }
+	operator int64_t() const { return counter; }
 };
 
 class KeyValueStoreSQLite : public IKeyValueStore {
 public:
-	virtual void dispose() {
-		doClose(this, true);
-	}
-	virtual void close() {
-		doClose(this, false);
-	}
+	virtual void dispose() override { doClose(this, true); }
+	virtual void close() override { doClose(this, false); }
 
-	virtual Future<Void> getError() { return delayed( readThreads->getError() || writeThread->getError() ); }
-	virtual Future<Void> onClosed() { return stopped.getFuture(); }
+	virtual Future<Void> getError() override { return delayed(readThreads->getError() || writeThread->getError()); }
+	virtual Future<Void> onClosed() override { return stopped.getFuture(); }
 
-	virtual KeyValueStoreType getType() { return type; }
-	virtual StorageBytes getStorageBytes();
+	virtual KeyValueStoreType getType() const override { return type; }
+	virtual StorageBytes getStorageBytes() const override;
 
-	virtual void set( KeyValueRef keyValue, const Arena* arena = NULL );
-	virtual void clear( KeyRangeRef range, const Arena* arena = NULL );
-	virtual Future<Void> commit(bool sequential = false);
+	virtual void set(KeyValueRef keyValue, const Arena* arena = nullptr) override;
+	virtual void clear(KeyRangeRef range, const Arena* arena = nullptr) override;
+	virtual Future<Void> commit(bool sequential = false) override;
 
-	virtual Future<Optional<Value>> readValue( KeyRef key, Optional<UID> debugID );
-	virtual Future<Optional<Value>> readValuePrefix( KeyRef key, int maxLength, Optional<UID> debugID );
-	virtual Future<Standalone<VectorRef<KeyValueRef>>> readRange( KeyRangeRef keys, int rowLimit = 1<<30, int byteLimit = 1<<30 );
+	virtual Future<Optional<Value>> readValue(KeyRef key, Optional<UID> debugID) override;
+	virtual Future<Optional<Value>> readValuePrefix(KeyRef key, int maxLength, Optional<UID> debugID) override;
+	virtual Future<Standalone<RangeResultRef>> readRange(KeyRangeRef keys, int rowLimit = 1 << 30,
+	                                                     int byteLimit = 1 << 30) override;
 
 	KeyValueStoreSQLite(std::string const& filename, UID logID, KeyValueStoreType type, bool checkChecksums, bool checkIntegrity);
 	~KeyValueStoreSQLite();
@@ -1549,7 +1560,7 @@ private:
 		struct ReadRangeAction : TypedAction<Reader, ReadRangeAction>, FastAllocated<ReadRangeAction> {
 			KeyRange keys;
 			int rowLimit, byteLimit;
-			ThreadReturnPromise<Standalone<VectorRef<KeyValueRef>>> result;
+			ThreadReturnPromise<Standalone<RangeResultRef>> result;
 			ReadRangeAction(KeyRange keys, int rowLimit, int byteLimit) : keys(keys), rowLimit(rowLimit), byteLimit(byteLimit) {}
 			virtual double getTimeEstimate() { return SERVER_KNOBS->READ_RANGE_TIME_ESTIMATE; }
 		};
@@ -1582,7 +1593,7 @@ private:
 			  springCleaningStats(springCleaningStats),
 			  diskBytesUsed(diskBytesUsed),
 			  freeListPages(freeListPages),
-			  cursor(NULL),
+			  cursor(nullptr),
 			  dbgid(dbgid),
 			  readThreads(*pReadThreads),
 			  checkAllChecksumsOnOpen(checkAllChecksumsOnOpen),
@@ -1673,7 +1684,7 @@ private:
 			double t1 = now();
 			cursor->commit();
 			delete cursor;
-			cursor = NULL;
+			cursor = nullptr;
 
 			double t2 = now();
 
@@ -1702,7 +1713,7 @@ private:
 		//Checkpoints the database and resets the wal file back to the beginning
 		void fullCheckpoint() {
 			//A checkpoint cannot succeed while there is an outstanding transaction
-			ASSERT(cursor == NULL);
+			ASSERT(cursor == nullptr);
 
 			resetReaders();
 			conn.checkpoint(false);
@@ -1844,13 +1855,15 @@ private:
 	ACTOR static Future<Void> stopOnError( KeyValueStoreSQLite* self ) {
 		try {
 			wait( self->readThreads->getError() || self->writeThread->getError() );
+			ASSERT(false);
 		} catch (Error& e) {
 			if (e.code() == error_code_actor_cancelled)
 				throw;
+
+			self->readThreads->stop(e);
+			self->writeThread->stop(e);
 		}
 
-		self->readThreads->stop();
-		self->writeThread->stop();
 		return Void();
 	}
 
@@ -1952,7 +1965,7 @@ KeyValueStoreSQLite::~KeyValueStoreSQLite() {
 	//printf("dbf=%lld bytes, wal=%lld bytes\n", getFileSize((filename+".fdb").c_str()), getFileSize((filename+".fdb-wal").c_str()));
 }
 
-StorageBytes KeyValueStoreSQLite::getStorageBytes() {
+StorageBytes KeyValueStoreSQLite::getStorageBytes() const {
 	int64_t free;
 	int64_t total;
 
@@ -1999,7 +2012,7 @@ Future<Optional<Value>> KeyValueStoreSQLite::readValuePrefix( KeyRef key, int ma
 	readThreads->post(p);
 	return f;
 }
-Future<Standalone<VectorRef<KeyValueRef>>> KeyValueStoreSQLite::readRange( KeyRangeRef keys, int rowLimit, int byteLimit ) {
+Future<Standalone<RangeResultRef>> KeyValueStoreSQLite::readRange( KeyRangeRef keys, int rowLimit, int byteLimit ) {
 	++readsRequested;
 	auto p = new Reader::ReadRangeAction(keys, rowLimit, byteLimit);
 	auto f = p->result.getFuture();
@@ -2065,4 +2078,3 @@ ACTOR Future<Void> KVFileCheck(std::string filename, bool integrity) {
 
 	return Void();
 }
-
