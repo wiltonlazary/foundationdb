@@ -240,41 +240,16 @@ struct MasterData : NonCopyable, ReferenceCounted<MasterData> {
 
 	std::vector<WorkerInterface> backupWorkers; // Recruited backup workers from cluster controller.
 
-	MasterData(
-		Reference<AsyncVar<ServerDBInfo>> const& dbInfo,
-		MasterInterface const& myInterface,
-		ServerCoordinators const& coordinators,
-		ClusterControllerFullInterface const& clusterController,
-		Standalone<StringRef> const& dbId,
-		PromiseStream<Future<Void>> const& addActor,
-		bool forceRecovery
-		)
-		: dbgid(myInterface.id()),
-		  myInterface(myInterface),
-		  dbInfo(dbInfo),
-		  cstate(coordinators, addActor, dbgid),
-		  coordinators(coordinators),
-		  clusterController(clusterController),
-		  dbId(dbId),
-		  forceRecovery(forceRecovery),
-		  safeLocality(tagLocalityInvalid),
-		  primaryLocality(tagLocalityInvalid),
-		  neverCreated(false),
-		  lastEpochEnd(invalidVersion),
-		  liveCommittedVersion(invalidVersion),
-		  databaseLocked(false),
-		  minKnownCommittedVersion(invalidVersion),
-		  recoveryTransactionVersion(invalidVersion),
-		  lastCommitTime(0),
-		  registrationCount(0),
-		  version(invalidVersion),
-		  lastVersionTime(0),
-		  txnStateStore(0),
-		  memoryLimit(2e9),
-		  addActor(addActor),
-		  hasConfiguration(false),
-		  recruitmentStalled( Reference<AsyncVar<bool>>( new AsyncVar<bool>() ) )
-	{
+	MasterData(Reference<AsyncVar<ServerDBInfo>> const& dbInfo, MasterInterface const& myInterface,
+	           ServerCoordinators const& coordinators, ClusterControllerFullInterface const& clusterController,
+	           Standalone<StringRef> const& dbId, PromiseStream<Future<Void>> const& addActor, bool forceRecovery)
+	  : dbgid(myInterface.id()), myInterface(myInterface), dbInfo(dbInfo), cstate(coordinators, addActor, dbgid),
+	    coordinators(coordinators), clusterController(clusterController), dbId(dbId), forceRecovery(forceRecovery),
+	    safeLocality(tagLocalityInvalid), primaryLocality(tagLocalityInvalid), neverCreated(false),
+	    lastEpochEnd(invalidVersion), liveCommittedVersion(invalidVersion), databaseLocked(false),
+	    minKnownCommittedVersion(invalidVersion), recoveryTransactionVersion(invalidVersion), lastCommitTime(0),
+	    registrationCount(0), version(invalidVersion), lastVersionTime(0), txnStateStore(0), memoryLimit(2e9),
+	    addActor(addActor), hasConfiguration(false), recruitmentStalled(makeReference<AsyncVar<bool>>(false)) {
 		if(forceRecovery && !myInterface.locality.dcId().present()) {
 			TraceEvent(SevError, "ForcedRecoveryRequiresDcID");
 			forceRecovery = false;
@@ -1277,6 +1252,7 @@ ACTOR Future<Void> trackTlogRecovery( Reference<MasterData> self, Reference<Asyn
 			TraceEvent("MasterRecoveryState", self->dbgid)
 			.detail("StatusCode", RecoveryStatus::fully_recovered)
 			.detail("Status", RecoveryStatus::names[RecoveryStatus::fully_recovered])
+			.detail("FullyRecoveredAtVersion", self->version)
 			.trackLatest("MasterRecoveryState");
 
 			TraceEvent("MasterRecoveryGenerations", self->dbgid)
@@ -1570,6 +1546,22 @@ ACTOR Future<Void> masterCore( Reference<MasterData> self ) {
 	CommitTransactionRef &tr = recoveryCommitRequest.transaction;
 	int mmApplied = 0;  // The number of mutations in tr.mutations that have been applied to the txnStateStore so far
 	if (self->lastEpochEnd != 0) {
+		Optional<Value> snapRecoveryFlag = self->txnStateStore->readValue(writeRecoveryKey).get();
+		TraceEvent("MasterRecoverySnapshotCheck")
+		    .detail("SnapRecoveryFlag", snapRecoveryFlag.present() ? snapRecoveryFlag.get().toString() : "N/A")
+		    .detail("LastEpochEnd", self->lastEpochEnd);
+		if (snapRecoveryFlag.present()) {
+			TEST(true); // Recovering from snapshot, writing to snapShotEndVersionKey
+			BinaryWriter bw(Unversioned());
+			tr.set(recoveryCommitRequest.arena, snapshotEndVersionKey, (bw << self->lastEpochEnd).toValue());
+			// Pause the backups that got restored in this snapshot to avoid data corruption
+			// Requires further operational work to abort the backup
+			TraceEvent("MasterRecoveryPauseBackupAgents");
+			Key backupPauseKey = FileBackupAgent::getPauseKey();
+			tr.set(recoveryCommitRequest.arena, backupPauseKey, StringRef());
+			// Clear the key so multiple recoveries will not overwrite the first version recorded
+			tr.clear(recoveryCommitRequest.arena, singleKeyRange(writeRecoveryKey));
+		}
 		if(self->forceRecovery) {
 			BinaryWriter bw(Unversioned());
 			tr.set(recoveryCommitRequest.arena, killStorageKey, (bw << self->safeLocality).toValue());
@@ -1616,7 +1608,7 @@ ACTOR Future<Void> masterCore( Reference<MasterData> self ) {
 		}
 	}
 
-	applyMetadataMutations(self->dbgid, recoveryCommitRequest.arena, tr.mutations.slice(mmApplied, tr.mutations.size()),
+	applyMetadataMutations(SpanID(), self->dbgid, recoveryCommitRequest.arena, tr.mutations.slice(mmApplied, tr.mutations.size()),
 	                       self->txnStateStore);
 	mmApplied = tr.mutations.size();
 
@@ -1690,6 +1682,10 @@ ACTOR Future<Void> masterCore( Reference<MasterData> self ) {
 		.detail("StoreType", self->configuration.storageServerStoreType)
 		.detail("RecoveryDuration", recoveryDuration)
 		.trackLatest("MasterRecoveryState");
+
+	TraceEvent("MasterRecoveryAvailable", self->dbgid)
+		.detail("AvailableAtVersion", self->version)
+		.trackLatest("MasterRecoveryAvailable");
 
 	if( self->resolvers.size() > 1 )
 		self->addActor.send( resolutionBalancing(self) );

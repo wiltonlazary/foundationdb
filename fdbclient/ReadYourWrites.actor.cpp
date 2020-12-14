@@ -1228,7 +1228,7 @@ ACTOR Future<Standalone<RangeResultRef>> getWorkerInterfaces (Reference<ClusterC
 }
 
 Future< Optional<Value> > ReadYourWritesTransaction::get( const Key& key, bool snapshot ) {
-	TEST(true);
+	TEST(true); // ReadYourWritesTransaction::get
 
 	if (getDatabase()->apiVersionAtLeast(630)) {
 		if (specialKeys.contains(key)) {
@@ -1313,7 +1313,8 @@ Future< Standalone<RangeResultRef> > ReadYourWritesTransaction::getRange(
 	bool reverse )
 {
 	if (getDatabase()->apiVersionAtLeast(630)) {
-		if (specialKeys.contains(begin.getKey()) && end.getKey() <= specialKeys.end) {
+		if (specialKeys.contains(begin.getKey()) && specialKeys.begin <= end.getKey() &&
+		    end.getKey() <= specialKeys.end) {
 			TEST(true); // Special key space get range
 			return getDatabase()->specialKeySpace->getRange(this, begin, end, limits, reverse);
 		}
@@ -1399,6 +1400,20 @@ Future<int64_t> ReadYourWritesTransaction::getEstimatedRangeSizeBytes(const KeyR
 		return resetPromise.getFuture().getError();
 
 	return map(waitOrError(tr.getStorageMetrics(keys, -1), resetPromise.getFuture()), [](const StorageMetrics& m) { return m.bytes; });
+}
+
+Future<Standalone<VectorRef<KeyRef>>> ReadYourWritesTransaction::getRangeSplitPoints(const KeyRange& range,
+                                                                                     int64_t chunkSize) {
+	if (checkUsedDuringCommit()) {
+		return used_during_commit();
+	}
+	if (resetPromise.isSet()) return resetPromise.getFuture().getError();
+
+	KeyRef maxKey = getMaxReadKey();
+	if(range.begin > maxKey || range.end > maxKey)
+		return key_outside_legal_range();
+
+	return waitOrError(tr.getRangeSplitPoints(range, chunkSize), resetPromise.getFuture());
 }
 
 void ReadYourWritesTransaction::addReadConflictRange( KeyRangeRef const& keys ) {
@@ -1576,6 +1591,14 @@ void ReadYourWritesTransaction::getWriteConflicts( KeyRangeMap<bool> *result ) {
 	if( inConflictRange ) {
 		result->insert(  KeyRangeRef( conflictBegin.toArenaOrRef(arena), getMaxWriteKey() ), true );
 	}
+}
+
+void ReadYourWritesTransaction::setTransactionID(uint64_t id) {
+	tr.setTransactionID(id);
+}
+
+void ReadYourWritesTransaction::setToken(uint64_t token) {
+	tr.setToken(token);
 }
 
 Standalone<RangeResultRef> ReadYourWritesTransaction::getReadConflictRangeIntersecting(KeyRangeRef kr) {

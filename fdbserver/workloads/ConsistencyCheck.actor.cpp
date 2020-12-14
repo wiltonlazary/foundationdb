@@ -34,6 +34,7 @@
 #include "flow/DeterministicRandom.h"
 #include "fdbclient/ManagementAPI.actor.h"
 #include "flow/actorcompiler.h"  // This must be the last #include.
+#include "flow/network.h"
 
 //#define SevCCheckInfo SevVerbose
 #define SevCCheckInfo SevInfo
@@ -105,15 +106,9 @@ struct ConsistencyCheckWorkload : TestWorkload
 		bytesReadInPreviousRound = 0;
 	}
 
-	virtual std::string description()
-	{
-		return "ConsistencyCheck";
-	}
+	std::string description() const override { return "ConsistencyCheck"; }
 
-	virtual Future<Void> setup(Database const& cx)
-	{
-		return _setup(cx, this);
-	}
+	Future<Void> setup(Database const& cx) override { return _setup(cx, this); }
 
 	ACTOR Future<Void> _setup(Database cx, ConsistencyCheckWorkload *self)
 	{
@@ -139,21 +134,14 @@ struct ConsistencyCheckWorkload : TestWorkload
 		return Void();
 	}
 
-	virtual Future<Void> start(Database const& cx)
-	{
+	Future<Void> start(Database const& cx) override {
 		TraceEvent("ConsistencyCheck");
 		return _start(cx, this);
 	}
 
-	virtual Future<bool> check(Database const& cx)
-	{
-		return success;
-	}
+	Future<bool> check(Database const& cx) override { return success; }
 
-	virtual void getMetrics( vector<PerfMetric>& m )
-	{
-
-	}
+	void getMetrics(vector<PerfMetric>& m) override {}
 
 	void testFailure(std::string message, bool isError = false)
 	{
@@ -1308,7 +1296,7 @@ struct ConsistencyCheckWorkload : TestWorkload
 
 		vector<ISimulator::ProcessInfo*> all = g_simulator.getAllProcesses();
 		for(int i = 0; i < all.size(); i++) {
-			if( all[i]->isReliable() && all[i]->name == std::string("Server") && all[i]->startingClass != ProcessClass::TesterClass ) {
+			if( all[i]->isReliable() && all[i]->name == std::string("Server") && all[i]->startingClass != ProcessClass::TesterClass && all[i]->protocolVersion == g_network->protocolVersion() ) {
 				if(!workerAddresses.count(all[i]->address)) {
 					TraceEvent("ConsistencyCheck_WorkerMissingFromList").detail("Addr", all[i]->address);
 					return false;

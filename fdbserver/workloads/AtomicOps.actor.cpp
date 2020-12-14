@@ -101,16 +101,16 @@ struct AtomicOpsWorkload : TestWorkload {
 		// case 10:
 		// 	TEST(true); // Testing atomic CompareAndClear Not supported yet
 		// 	opType = MutationRef::CompareAndClear
-		// 	break;
+		//  break;
 		default:
 			ASSERT(false);
 		}
 		TraceEvent("AtomicWorkload").detail("OpType", opType);
 	}
 
-	virtual std::string description() { return "AtomicOps"; }
+	std::string description() const override { return "AtomicOps"; }
 
-	virtual Future<Void> setup( Database const& cx ) {
+	Future<Void> setup(Database const& cx) override {
 		if (apiVersion500)
 			cx->apiVersion = 500;
 
@@ -119,7 +119,7 @@ struct AtomicOpsWorkload : TestWorkload {
 		return _setup( cx, this );
 	}
 
-	virtual Future<Void> start( Database const& cx ) {
+	Future<Void> start(Database const& cx) override {
 		for (int c = 0; c < actorCount; c++) {
 			clients.push_back(
 			    timeout(atomicOpWorker(cx->clone(), this, actorCount / transactionsPerSecond), testDuration, Void()));
@@ -128,14 +128,13 @@ struct AtomicOpsWorkload : TestWorkload {
 		return delay(testDuration);
 	}
 
-	virtual Future<bool> check( Database const& cx ) {
+	Future<bool> check(Database const& cx) override {
 		if(clientId != 0)
 			return true;
 		return _check( cx, this );
 	}
 
-	virtual void getMetrics( vector<PerfMetric>& m ) {
-	}
+	void getMetrics(vector<PerfMetric>& m) override {}
 
 	std::pair<Key, Key> logDebugKey(int group) {
 		Key logKey(format("log%08x%08x%08x", group, clientId, opNum));

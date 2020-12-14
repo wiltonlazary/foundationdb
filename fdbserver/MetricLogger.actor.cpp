@@ -24,6 +24,7 @@
 #include "fdbclient/DatabaseContext.h"
 #include "fdbclient/ReadYourWrites.h"
 #include "fdbclient/KeyBackedTypes.h"
+#include "fdbserver/MetricLogger.h"
 #include "flow/actorcompiler.h"  // This must be the last #include.
 
 struct MetricsRule {
@@ -341,7 +342,7 @@ ACTOR Future<Void> updateMetricRegistration(Database cx, MetricsConfig *config, 
 		loop {
 			tr.setOption(FDBTransactionOptions::ACCESS_SYSTEM_KEYS);
 			try {
-				Value timestamp = BinaryWriter::toValue(CompressedInt<int64_t>(now()), AssumeVersion(currentProtocolVersion));
+				Value timestamp = BinaryWriter::toValue(CompressedInt<int64_t>(now()), AssumeVersion(g_network->protocolVersion()));
 				for(auto &key : keys) {
 					//fprintf(stderr, "%s: register: %s\n", collection->address.toString().c_str(), printable(key).c_str());
 					tr.set(key, timestamp);

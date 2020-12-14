@@ -221,7 +221,7 @@ struct MetricData {
 	BinaryWriter writer;
 
 	explicit MetricData(uint64_t appendStart = 0) :
-		writer(AssumeVersion(currentProtocolVersion)),
+		writer(AssumeVersion(g_network->protocolVersion())),
 		start(0),
 		rollTime(std::numeric_limits<uint64_t>::max()),
 		appendStart(appendStart) {
@@ -266,7 +266,7 @@ struct MetricUtil {
 		// If we don't have a valid metric reference yet and the create flag was set then create one and possibly put it in the map
 		if(!m && create) {
 			// Metric not found in collection but create is set then create it in the map
-			m = Reference<T>(new T(mname, initial));
+			m = makeReference<T>(mname, initial);
 			if(useMap) {
 				collection->metricMap[mname] = m.template castTo<BaseMetric>();
 				collection->metricAdded.trigger();
@@ -521,7 +521,7 @@ struct FieldLevel {
 
 	// Calculate header as of the end of a value block
 	static Header calculateHeader(StringRef block) {
-		BinaryReader r(block, AssumeVersion(currentProtocolVersion));
+		BinaryReader r(block, AssumeVersion(g_network->protocolVersion()));
 		Header h;
 		r >> h;
 		Encoder dec;
@@ -534,11 +534,11 @@ struct FieldLevel {
 
 	// Read header at position, update it with previousHeader, overwrite old header with new header.
 	static void updateSerializedHeader(StringRef buf, const Header &patch) {
-		BinaryReader r(buf, AssumeVersion(currentProtocolVersion));
+		BinaryReader r(buf, AssumeVersion(g_network->protocolVersion()));
 		Header h;
 		r >> h;
 		h.update(patch);
-		OverWriter w(mutateString(buf), buf.size(), AssumeVersion(currentProtocolVersion));
+		OverWriter w(mutateString(buf), buf.size(), AssumeVersion(g_network->protocolVersion()));
 		w << h;
 	}
 
@@ -1257,7 +1257,7 @@ public:
 
 	Standalone<StringRef> getLatestAsValue() {
 		FieldValueBlockEncoding< TimeAndValue< T > > enc;
-		BinaryWriter wr(AssumeVersion(currentProtocolVersion));
+		BinaryWriter wr(AssumeVersion(g_network->protocolVersion()));
 		// Write a header so the client can treat this value like a normal data value block.
 		// TOOD: If it is useful, this could be the current header value of the most recently logged level.
 		wr << FieldHeader<TimeAndValue<T>>();

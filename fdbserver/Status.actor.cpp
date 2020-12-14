@@ -487,6 +487,7 @@ struct RolesInfo {
 
 			obj["data_lag"] = getLagObject(versionLag);
 			obj["durability_lag"] = getLagObject(version - durableVersion);
+			dataLagSeconds = versionLag / (double)SERVER_KNOBS->VERSIONS_PER_SECOND;
 
 			TraceEventFields const& busiestReadTag = metrics.at("BusiestReadTag");
 			if(busiestReadTag.size()) {
@@ -1047,18 +1048,37 @@ static JsonBuilderObject clientStatusFetcher(std::map<NetworkAddress, std::pair<
 	return clientStatus;
 }
 
-ACTOR static Future<JsonBuilderObject> recoveryStateStatusFetcher(WorkerDetails mWorker, int workerCount, std::set<std::string> *incomplete_reasons, int* statusCode) {
+ACTOR static Future<JsonBuilderObject> recoveryStateStatusFetcher(Database cx, WorkerDetails mWorker, int workerCount, std::set<std::string> *incomplete_reasons, int* statusCode) {
 	state JsonBuilderObject message;
-
+	state Transaction tr(cx);
 	try {
-		state Future<TraceEventFields> activeGens = timeoutError(mWorker.interf.eventLogRequest.getReply( EventLogRequest( LiteralStringRef("MasterRecoveryGenerations") ) ), 1.0);
-		TraceEventFields md = wait( timeoutError(mWorker.interf.eventLogRequest.getReply( EventLogRequest( LiteralStringRef("MasterRecoveryState") ) ), 1.0) );
+		state Future<TraceEventFields> mdActiveGensF = timeoutError(mWorker.interf.eventLogRequest.getReply( EventLogRequest( LiteralStringRef("MasterRecoveryGenerations") ) ), 1.0);
+		state Future<TraceEventFields> mdF = timeoutError(mWorker.interf.eventLogRequest.getReply( EventLogRequest( LiteralStringRef("MasterRecoveryState") ) ), 1.0);
+		state Future<TraceEventFields> mDBAvailableF = timeoutError(mWorker.interf.eventLogRequest.getReply( EventLogRequest( LiteralStringRef("MasterRecoveryAvailable") ) ), 1.0);
+		tr.setOption(FDBTransactionOptions::PRIORITY_SYSTEM_IMMEDIATE);
+		state Future<ErrorOr<Version>> rvF = errorOr(timeoutError(tr.getReadVersion(), 1.0));
+
+		wait(success(mdActiveGensF) && success(mdF) && success(rvF) && success(mDBAvailableF));
+
+		const TraceEventFields& md = mdF.get();
 		int mStatusCode = md.getInt("StatusCode");
 		if (mStatusCode < 0 || mStatusCode >= RecoveryStatus::END)
 			throw attribute_not_found();
 
 		message = JsonString::makeMessage(RecoveryStatus::names[mStatusCode], RecoveryStatus::descriptions[mStatusCode]);
 		*statusCode = mStatusCode;
+
+		ErrorOr<Version> rv = rvF.get();
+		const TraceEventFields& dbAvailableMsg = mDBAvailableF.get();
+		if (dbAvailableMsg.size() > 0) {
+			int64_t availableAtVersion = dbAvailableMsg.getInt64("AvailableAtVersion");
+			if (!rv.isError()) {
+				double lastRecoveredSecondsAgo = std::max((int64_t)0, (int64_t)(rv.get() - availableAtVersion)) / (double)SERVER_KNOBS->VERSIONS_PER_SECOND;
+				message["seconds_since_last_recovered"] = lastRecoveredSecondsAgo;
+			}
+		} else {
+			message["seconds_since_last_recovered"] = -1;
+		}
 
 		// Add additional metadata for certain statuses
 		if (mStatusCode == RecoveryStatus::recruiting_transaction_servers) {
@@ -1079,7 +1099,7 @@ ACTOR static Future<JsonBuilderObject> recoveryStateStatusFetcher(WorkerDetails 
 		// TODO:  time_in_recovery: 0.5
 		//        time_in_state: 0.1
 
-		TraceEventFields mdActiveGens = wait(activeGens);
+		const TraceEventFields& mdActiveGens = mdActiveGensF.get();
 		if(mdActiveGens.size()) {
 			int activeGenerations = mdActiveGens.getInt("ActiveGenerations");
 			message["active_generations"] = activeGenerations;
@@ -1099,7 +1119,7 @@ ACTOR static Future<JsonBuilderObject> recoveryStateStatusFetcher(WorkerDetails 
 }
 
 ACTOR static Future<double> doGrvProbe(Transaction *tr, Optional<FDBTransactionOptions::Option> priority = Optional<FDBTransactionOptions::Option>()) {
-	state double start = timer_monotonic();
+	state double start = g_network->timer_monotonic();
 
 	loop {
 		try {
@@ -1109,7 +1129,7 @@ ACTOR static Future<double> doGrvProbe(Transaction *tr, Optional<FDBTransactionO
 			}
 
 			wait(success(tr->getReadVersion()));
-			return timer_monotonic() - start;
+			return g_network->timer_monotonic() - start;
 		}
 		catch(Error &e) {
 			wait(tr->onError(e));
@@ -1123,13 +1143,13 @@ ACTOR static Future<double> doReadProbe(Future<double> grvProbe, Transaction *tr
 		throw grv.getError();
 	}
 
-	state double start = timer_monotonic();
+	state double start = g_network->timer_monotonic();
 
 	loop {
 		tr->setOption(FDBTransactionOptions::LOCK_AWARE);
 		try {
 			Optional<Standalone<StringRef> > _ = wait(tr->get(LiteralStringRef("\xff/StatusJsonTestKey62793")));
-			return timer_monotonic() - start;
+			return g_network->timer_monotonic() - start;
 		}
 		catch(Error &e) {
 			wait(tr->onError(e));
@@ -1147,7 +1167,7 @@ ACTOR static Future<double> doCommitProbe(Future<double> grvProbe, Transaction *
 	ASSERT(sourceTr->getReadVersion().isReady());
 	tr->setVersion(sourceTr->getReadVersion().get());
 
-	state double start = timer_monotonic();
+	state double start = g_network->timer_monotonic();
 
 	loop {
 		try {
@@ -1155,7 +1175,7 @@ ACTOR static Future<double> doCommitProbe(Future<double> grvProbe, Transaction *
 			tr->setOption(FDBTransactionOptions::PRIORITY_SYSTEM_IMMEDIATE);
 			tr->makeSelfConflicting();
 			wait(tr->commit());
-			return timer_monotonic() - start;
+			return g_network->timer_monotonic() - start;
 		}
 		catch(Error &e) {
 			wait(tr->onError(e));
@@ -1700,24 +1720,27 @@ static int getExtraTLogEligibleZones(const vector<WorkerDetails>& workers, const
 	if(configuration.regions.size() == 0) {
 		return allZones.size() - std::max(configuration.tLogReplicationFactor, configuration.storageTeamSize);
 	}
-	int extraTlogEligibleZones = configuration.usableRegions == 1 ? 0 : std::numeric_limits<int>::max();
+	int extraTlogEligibleZones = 0;
+	int regionsWithNonNegativePriority = 0;
 	for(auto& region : configuration.regions) {
-		int eligible = dcId_zone[region.dcId].size() - std::max(configuration.remoteTLogReplicationFactor, std::max(configuration.tLogReplicationFactor, configuration.storageTeamSize) );
-		//FIXME: does not take into account fallback satellite policies
-		if(region.satelliteTLogReplicationFactor > 0 && configuration.usableRegions > 1) {
-			int totalSatelliteEligible = 0;
-			for(auto& sat : region.satellites) {
-				totalSatelliteEligible += dcId_zone[sat.dcId].size();
+		if( region.priority >= 0 ) {
+			int eligible = dcId_zone[region.dcId].size() - std::max(configuration.remoteTLogReplicationFactor, std::max(configuration.tLogReplicationFactor, configuration.storageTeamSize) );
+			//FIXME: does not take into account fallback satellite policies
+			if(region.satelliteTLogReplicationFactor > 0 && configuration.usableRegions > 1) {
+				int totalSatelliteEligible = 0;
+				for(auto& sat : region.satellites) {
+					totalSatelliteEligible += dcId_zone[sat.dcId].size();
+				}
+				eligible = std::min<int>( eligible, totalSatelliteEligible - region.satelliteTLogReplicationFactor );
 			}
-			eligible = std::min<int>( eligible, totalSatelliteEligible - region.satelliteTLogReplicationFactor );
-		}
-		if( configuration.usableRegions == 1 ) {
-			if( region.priority >= 0 ) {
-				extraTlogEligibleZones = std::max( extraTlogEligibleZones, eligible );
+			if(eligible >= 0) {
+				regionsWithNonNegativePriority++;
 			}
-		} else {
-			extraTlogEligibleZones = std::min( extraTlogEligibleZones, eligible );
+			extraTlogEligibleZones = std::max( extraTlogEligibleZones, eligible );
 		}
+	}
+	if(regionsWithNonNegativePriority > 1) {
+		extraTlogEligibleZones++;
 	}
 	return extraTlogEligibleZones;
 }
@@ -2020,7 +2043,8 @@ static JsonBuilderObject tlogFetcher(int* logFaultTolerance, const std::vector<T
 	    log_replication_factor, log_write_anti_quorum, log_fault_tolerance, remote_log_replication_factor,
 	    remote_log_fault_tolerance;
 
-	int maxFaultTolerance = 0;
+	int minFaultTolerance = 1000;
+	int localSetsWithNonNegativeFaultTolerance = 0;
 
 	for (int i = 0; i < tLogs.size(); i++) {
 		int failedLogs = 0;
@@ -2037,9 +2061,15 @@ static JsonBuilderObject tlogFetcher(int* logFaultTolerance, const std::vector<T
 				failedLogs++;
 			}
 		}
-		// The log generation's fault tolerance is the maximum tlog fault tolerance of each region.
-		maxFaultTolerance =
-		    std::max(maxFaultTolerance, tLogs[i].tLogReplicationFactor - 1 - tLogs[i].tLogWriteAntiQuorum - failedLogs);
+
+		if (tLogs[i].isLocal) {
+			int currentFaultTolerance = tLogs[i].tLogReplicationFactor - 1 - tLogs[i].tLogWriteAntiQuorum - failedLogs;
+			if(currentFaultTolerance >= 0) {
+				localSetsWithNonNegativeFaultTolerance++;
+			}
+			minFaultTolerance = std::min(minFaultTolerance, currentFaultTolerance);
+		}
+
 		if (tLogs[i].isLocal && tLogs[i].locality == tagLocalitySatellite) {
 			sat_log_replication_factor = tLogs[i].tLogReplicationFactor;
 			sat_log_write_anti_quorum = tLogs[i].tLogWriteAntiQuorum;
@@ -2053,11 +2083,18 @@ static JsonBuilderObject tlogFetcher(int* logFaultTolerance, const std::vector<T
 			remote_log_fault_tolerance = tLogs[i].tLogReplicationFactor - 1 - failedLogs;
 		}
 	}
-	*logFaultTolerance = std::min(*logFaultTolerance, maxFaultTolerance);
+	if(minFaultTolerance == 1000) {
+		//just in case we do not have any tlog sets
+		minFaultTolerance = 0;
+	}
+	if(localSetsWithNonNegativeFaultTolerance > 1) {
+		minFaultTolerance++;
+	}
+	*logFaultTolerance = std::min(*logFaultTolerance, minFaultTolerance);
 	statusObj["log_interfaces"] = logsObj;
 	// We may lose logs in this log generation, storage servers may never be able to catch up this log
 	// generation.
-	statusObj["possibly_losing_data"] = maxFaultTolerance < 0;
+	statusObj["possibly_losing_data"] = minFaultTolerance < 0;
 
 	if (sat_log_replication_factor.present())
 		statusObj["satellite_log_replication_factor"] = sat_log_replication_factor.get();
@@ -2102,12 +2139,13 @@ static JsonBuilderArray tlogFetcher(int* logFaultTolerance, Reference<AsyncVar<S
 static JsonBuilderObject faultToleranceStatusFetcher(DatabaseConfiguration configuration,
                                                      ServerCoordinators coordinators,
                                                      std::vector<WorkerDetails>& workers, int extraTlogEligibleZones,
-                                                     int minReplicasRemaining, int oldLogFaultTolerance,
+                                                     int minReplicasRemaining, int oldLogFaultTolerance, 
+													 int fullyReplicatedRegions,
                                                      bool underMaintenance) {
 	JsonBuilderObject statusObj;
 
 	// without losing data
-	int32_t maxZoneFailures = configuration.maxZoneFailuresTolerated();
+	int32_t maxZoneFailures = configuration.maxZoneFailuresTolerated(fullyReplicatedRegions, false);
 	if(underMaintenance) {
 		maxZoneFailures--;
 	}
@@ -2145,8 +2183,14 @@ static JsonBuilderObject faultToleranceStatusFetcher(DatabaseConfiguration confi
 	// oldLogFaultTolerance means max failures we can tolerate to lose logs data. -1 means we lose data or availability.
 	zoneFailuresWithoutLosingData = std::max(std::min(zoneFailuresWithoutLosingData, oldLogFaultTolerance), -1);
 	statusObj["max_zone_failures_without_losing_data"] = zoneFailuresWithoutLosingData;
+
+	int32_t maxAvaiabilityZoneFailures = configuration.maxZoneFailuresTolerated(fullyReplicatedRegions, true);
+	if(underMaintenance) {
+		maxAvaiabilityZoneFailures--;
+	}
+
 	statusObj["max_zone_failures_without_losing_availability"] =
-	    std::max(std::min(extraTlogEligibleZones, zoneFailuresWithoutLosingData), -1);
+	    std::max(std::min(maxAvaiabilityZoneFailures,std::min(extraTlogEligibleZones, zoneFailuresWithoutLosingData)), -1);
 	return statusObj;
 }
 
@@ -2323,7 +2367,7 @@ ACTOR Future<JsonBuilderObject> lockedStatusFetcher(Reference<AsyncVar<ServerDBI
 	return statusObj;
 }
 
-ACTOR Future<Optional<Value>> getActivePrimaryDC(Database cx, JsonBuilderArray* messages) {
+ACTOR Future<Optional<Value>> getActivePrimaryDC(Database cx, int* fullyReplicatedRegions, JsonBuilderArray* messages) {
 	state ReadYourWritesTransaction tr(cx);
 
 	state Future<Void> readTimeout = delay(5); // so that we won't loop forever
@@ -2334,12 +2378,17 @@ ACTOR Future<Optional<Value>> getActivePrimaryDC(Database cx, JsonBuilderArray* 
 			}
 			tr.setOption(FDBTransactionOptions::READ_SYSTEM_KEYS);
 			tr.setOption(FDBTransactionOptions::PRIORITY_SYSTEM_IMMEDIATE);
-			Optional<Value> res = wait(timeoutError(tr.get(primaryDatacenterKey), 5));
-			if (!res.present()) {
+			state Future<Standalone<RangeResultRef>> fReplicaKeys = tr.getRange(datacenterReplicasKeys, CLIENT_KNOBS->TOO_MANY);
+			state Future<Optional<Value>> fPrimaryDatacenterKey = tr.get(primaryDatacenterKey);
+			wait(timeoutError(success(fPrimaryDatacenterKey) && success(fReplicaKeys), 5));
+			
+			*fullyReplicatedRegions = fReplicaKeys.get().size();
+
+			if (!fPrimaryDatacenterKey.get().present()) {
 				messages->push_back(
 				    JsonString::makeMessage("primary_dc_missing", "Unable to determine primary datacenter."));
 			}
-			return res;
+			return fPrimaryDatacenterKey.get();
 		} catch (Error& e) {
 			if (e.code() == error_code_timed_out) {
 				messages->push_back(
@@ -2444,7 +2493,7 @@ ACTOR Future<StatusReply> clusterGetStatus(
 
 		// construct status information for cluster subsections
 		state int statusCode = (int) RecoveryStatus::END;
-		state JsonBuilderObject recoveryStateStatus = wait(recoveryStateStatusFetcher(mWorker, workers.size(), &status_incomplete_reasons, &statusCode));
+		state JsonBuilderObject recoveryStateStatus = wait(recoveryStateStatusFetcher(cx, mWorker, workers.size(), &status_incomplete_reasons, &statusCode));
 
 		// machine metrics
 		state WorkerEvents mMetrics = workerEventsVec[0].present() ? workerEventsVec[0].get().first : WorkerEvents();
@@ -2469,7 +2518,7 @@ ACTOR Future<StatusReply> clusterGetStatus(
 		state JsonBuilderObject qos;
 		state JsonBuilderObject data_overlay;
 
-		statusObj["protocol_version"] = format("%" PRIx64, currentProtocolVersion.version());
+		statusObj["protocol_version"] = format("%" PRIx64, g_network->protocolVersion().version());
 		statusObj["connection_string"] = coordinators.ccf->getConnectionString().toString();
 
 		state Optional<DatabaseConfiguration> configuration;
@@ -2533,7 +2582,8 @@ ACTOR Future<StatusReply> clusterGetStatus(
 			state Future<ErrorOr<vector<std::pair<GrvProxyInterface, EventMap>>>> grvProxyFuture = errorOr(getGrvProxiesAndMetrics(db, address_workers));
 
 			state int minReplicasRemaining = -1;
-			state Future<Optional<Value>> primaryDCFO = getActivePrimaryDC(cx, &messages);
+			state int fullyReplicatedRegions = -1;
+			state Future<Optional<Value>> primaryDCFO = getActivePrimaryDC(cx, &fullyReplicatedRegions, &messages);
 			std::vector<Future<JsonBuilderObject>> futures2;
 			futures2.push_back(dataStatusFetcher(ddWorker, configuration.get(), &minReplicasRemaining));
 			futures2.push_back(workloadStatusFetcher(db, workers, mWorker, rkWorker, &qos, &data_overlay, &status_incomplete_reasons, storageServerFuture));
@@ -2541,6 +2591,7 @@ ACTOR Future<StatusReply> clusterGetStatus(
 			futures2.push_back(lockedStatusFetcher(db, &messages, &status_incomplete_reasons));
 			futures2.push_back(clusterSummaryStatisticsFetcher(pMetrics, storageServerFuture, tLogFuture, &status_incomplete_reasons));
 			state std::vector<JsonBuilderObject> workerStatuses = wait(getAll(futures2));
+			wait(success(primaryDCFO));
 
 			int logFaultTolerance = 100;
 			if (db->get().recoveryState >= RecoveryState::ACCEPTING_COMMITS) {
@@ -2551,13 +2602,12 @@ ACTOR Future<StatusReply> clusterGetStatus(
 				int extraTlogEligibleZones = getExtraTLogEligibleZones(workers, configuration.get());
 				statusObj["fault_tolerance"] = faultToleranceStatusFetcher(
 				    configuration.get(), coordinators, workers, extraTlogEligibleZones, minReplicasRemaining,
-				    logFaultTolerance, loadResult.present() && loadResult.get().healthyZone.present());
+				    logFaultTolerance, fullyReplicatedRegions, loadResult.present() && loadResult.get().healthyZone.present());
 			}
 
 			state JsonBuilderObject configObj =
 			    configurationFetcher(configuration, coordinators, &status_incomplete_reasons);
 
-			wait(success(primaryDCFO));
 			if (primaryDCFO.get().present()) {
 				statusObj["active_primary_dc"] = primaryDCFO.get().get();
 			}
@@ -2689,7 +2739,7 @@ ACTOR Future<StatusReply> clusterGetStatus(
 
 		statusObj["messages"] = messages;
 
-		int64_t clusterTime = time(0);
+		int64_t clusterTime = g_network->timer();
 		if (clusterTime != -1){
 			statusObj["cluster_controller_timestamp"] = clusterTime;
 		}

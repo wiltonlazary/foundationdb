@@ -52,18 +52,18 @@ struct SpecialKeySpaceCorrectnessWorkload : TestWorkload {
 		ASSERT(conflictRangeSizeFactor >= 1);
 	}
 
-	virtual std::string description() { return "SpecialKeySpaceCorrectness"; }
-	virtual Future<Void> setup(Database const& cx) { return _setup(cx, this); }
-	virtual Future<Void> start(Database const& cx) { return _start(cx, this); }
-	virtual Future<bool> check(Database const& cx) { return wrongResults.getValue() == 0; }
-	virtual void getMetrics(std::vector<PerfMetric>& m) {}
+	std::string description() const override { return "SpecialKeySpaceCorrectness"; }
+	Future<Void> setup(Database const& cx) override { return _setup(cx, this); }
+	Future<Void> start(Database const& cx) override { return _start(cx, this); }
+	Future<bool> check(Database const& cx) override { return wrongResults.getValue() == 0; }
+	void getMetrics(std::vector<PerfMetric>& m) override {}
 
 	// disable the default timeout setting
-	double getCheckTimeout() override { return std::numeric_limits<double>::max(); }
+	double getCheckTimeout() const override { return std::numeric_limits<double>::max(); }
 
 	Future<Void> _setup(Database cx, SpecialKeySpaceCorrectnessWorkload* self) {
 		cx->specialKeySpace = std::make_unique<SpecialKeySpace>();
-		self->ryw = Reference(new ReadYourWritesTransaction(cx));
+		self->ryw = makeReference<ReadYourWritesTransaction>(cx);
 		self->ryw->setOption(FDBTransactionOptions::SPECIAL_KEY_SPACE_RELAXED);
 		self->ryw->setOption(FDBTransactionOptions::SPECIAL_KEY_SPACE_ENABLE_WRITES);
 		self->ryw->setVersion(100);
@@ -104,8 +104,12 @@ struct SpecialKeySpaceCorrectnessWorkload : TestWorkload {
 		Future<Void> f;
 		{
 			ReadYourWritesTransaction ryw{ cx->clone() };
+			if (!ryw.getDatabase()->apiVersionAtLeast(630)) {
+				// This test is not valid for API versions smaller than 630
+				return;
+			}
 			f = success(ryw.get(LiteralStringRef("\xff\xff/status/json")));
-			TEST(!f.isReady());
+			TEST(!f.isReady()); // status json not ready
 		}
 		ASSERT(f.isError());
 		ASSERT(f.getError().code() == error_code_transaction_cancelled);
@@ -274,7 +278,7 @@ struct SpecialKeySpaceCorrectnessWorkload : TestWorkload {
 
 	ACTOR Future<Void> testSpecialKeySpaceErrors(Database cx_, SpecialKeySpaceCorrectnessWorkload* self) {
 		Database cx = cx_->clone();
-		state Reference<ReadYourWritesTransaction> tx = Reference(new ReadYourWritesTransaction(cx));
+		state Reference<ReadYourWritesTransaction> tx = makeReference<ReadYourWritesTransaction>(cx);
 		// begin key outside module range
 		try {
 			wait(success(tx->getRange(
@@ -313,7 +317,7 @@ struct SpecialKeySpaceCorrectnessWorkload : TestWorkload {
 			wait(success(tx->getRange(
 			    KeyRangeRef(LiteralStringRef("\xff\xff/transaction/"), LiteralStringRef("\xff\xff/transaction0")),
 			    CLIENT_KNOBS->TOO_MANY)));
-			TEST(true);
+			TEST(true); // read transaction special keyrange
 			tx->reset();
 		} catch (Error& e) {
 			throw;
@@ -337,7 +341,7 @@ struct SpecialKeySpaceCorrectnessWorkload : TestWorkload {
 			KeySelector begin = KeySelectorRef(readConflictRangeKeysRange.begin, false, 1);
 			KeySelector end = KeySelectorRef(LiteralStringRef("\xff\xff/transaction0"), false, 0);
 			wait(success(tx->getRange(begin, end, GetRangeLimits(CLIENT_KNOBS->TOO_MANY))));
-			TEST(true);
+			TEST(true); // end key selector inside module range
 			tx->reset();
 		} catch (Error& e) {
 			throw;
@@ -416,6 +420,32 @@ struct SpecialKeySpaceCorrectnessWorkload : TestWorkload {
 			ASSERT(e.code() == error_code_special_keys_cross_module_clear);
 			tx->reset();
 		}
+		// base key of the end key selector not in (\xff\xff, \xff\xff\xff), throw key_outside_legal_range()
+		try {
+			const KeySelector startKeySelector = KeySelectorRef(LiteralStringRef("\xff\xff/test"), true, -200);
+			const KeySelector endKeySelector = KeySelectorRef(LiteralStringRef("test"), true, -10);
+			Standalone<RangeResultRef> result =
+			    wait(tx->getRange(startKeySelector, endKeySelector, GetRangeLimits(CLIENT_KNOBS->TOO_MANY)));
+			ASSERT(false);
+		} catch (Error& e) {
+			if (e.code() == error_code_actor_cancelled) throw;
+			ASSERT(e.code() == error_code_key_outside_legal_range);
+			tx->reset();
+		}
+		// test case when registered range is the same as the underlying module
+		try {
+			state Standalone<RangeResultRef> result = wait(tx->getRange(KeyRangeRef(LiteralStringRef("\xff\xff/worker_interfaces/"),
+			                         LiteralStringRef("\xff\xff/worker_interfaces0")),
+			             CLIENT_KNOBS->TOO_MANY));
+			// We should have at least 1 process in the cluster
+			ASSERT(result.size());
+			state KeyValueRef entry = deterministicRandom()->randomChoice(result);
+			Optional<Value> singleRes = wait(tx->get(entry.key));
+			ASSERT(singleRes.present() && singleRes.get() == entry.value);
+			tx->reset();
+		} catch (Error& e) {
+			wait(tx->onError(e));
+		}
 
 		return Void();
 	}
@@ -426,8 +456,8 @@ struct SpecialKeySpaceCorrectnessWorkload : TestWorkload {
 		TEST(!read); // test write conflict range special key implementation
 		// Get a default special key range instance
 		Database cx = cx_->clone();
-		state Reference<ReadYourWritesTransaction> tx = Reference(new ReadYourWritesTransaction(cx));
-		state Reference<ReadYourWritesTransaction> referenceTx = Reference(new ReadYourWritesTransaction(cx));
+		state Reference<ReadYourWritesTransaction> tx = makeReference<ReadYourWritesTransaction>(cx);
+		state Reference<ReadYourWritesTransaction> referenceTx = makeReference<ReadYourWritesTransaction>(cx);
 		state bool ryw = deterministicRandom()->coinflip();
 		if (!ryw) {
 			tx->setOption(FDBTransactionOptions::READ_YOUR_WRITES_DISABLE);
@@ -572,7 +602,7 @@ struct SpecialKeySpaceCorrectnessWorkload : TestWorkload {
 	ACTOR Future<Void> managementApiCorrectnessActor(Database cx_, SpecialKeySpaceCorrectnessWorkload* self) {
 		// All management api related tests
 		Database cx = cx_->clone();
-		state Reference<ReadYourWritesTransaction> tx = Reference(new ReadYourWritesTransaction(cx));
+		state Reference<ReadYourWritesTransaction> tx = makeReference<ReadYourWritesTransaction>(cx);
 		// test ordered option keys
 		{
 			tx->setOption(FDBTransactionOptions::SPECIAL_KEY_SPACE_ENABLE_WRITES);
@@ -737,8 +767,112 @@ struct SpecialKeySpaceCorrectnessWorkload : TestWorkload {
 					TraceEvent(SevDebug, "EmptyWorkerListInSetClassTest");
 				}
 			} catch (Error& e) {
-				if (e.code() == error_code_actor_cancelled) throw;
 				wait(tx->onError(e));
+			}
+		}
+		// test lock and unlock
+		// maske sure we lock the database
+		loop {
+			try {
+				tx->setOption(FDBTransactionOptions::SPECIAL_KEY_SPACE_ENABLE_WRITES);
+				// lock the database
+				tx->set(SpecialKeySpace::getManagementApiCommandPrefix("lock"), LiteralStringRef(""));
+				// commit
+				wait(tx->commit());
+				break;
+			} catch (Error& e) {
+				TraceEvent(SevDebug, "DatabaseLockFailure").error(e);
+				// In case commit_unknown_result is thrown by buggify, we may try to lock more than once
+				// The second lock commit will throw special_keys_api_failure error
+				if (e.code() == error_code_special_keys_api_failure) {
+					Optional<Value> errorMsg =
+					    wait(tx->get(SpecialKeySpace::getModuleRange(SpecialKeySpace::MODULE::ERRORMSG).begin));
+					ASSERT(errorMsg.present());
+					std::string errorStr;
+					auto valueObj = readJSONStrictly(errorMsg.get().toString()).get_obj();
+					auto schema = readJSONStrictly(JSONSchemas::managementApiErrorSchema.toString()).get_obj();
+					// special_key_space_management_api_error_msg schema validation
+					ASSERT(schemaMatch(schema, valueObj, errorStr, SevError, true));
+					ASSERT(valueObj["command"].get_str() == "lock" && !valueObj["retriable"].get_bool());
+					break;
+				} else {
+					wait(tx->onError(e));
+				}
+			}
+		}
+		TraceEvent(SevDebug, "DatabaseLocked");
+		// if database locked, fdb read should get database_locked error
+		try {
+			tx->reset();
+			Standalone<RangeResultRef> res = wait(tx->getRange(normalKeys, 1));
+		} catch (Error& e) {
+			if (e.code() == error_code_actor_cancelled) throw;
+			ASSERT(e.code() == error_code_database_locked);
+		}
+		// make sure we unlock the database
+		// unlock is idempotent, thus we can commit many times until successful
+		loop {
+			try {
+				tx->reset();
+				tx->setOption(FDBTransactionOptions::SPECIAL_KEY_SPACE_ENABLE_WRITES);
+				// unlock the database
+				tx->clear(SpecialKeySpace::getManagementApiCommandPrefix("lock"));
+				wait(tx->commit());
+				TraceEvent(SevDebug, "DatabaseUnlocked");
+				tx->reset();
+				// read should be successful
+				Standalone<RangeResultRef> res = wait(tx->getRange(normalKeys, 1));
+				tx->reset();
+				break;
+			} catch (Error& e) {
+				TraceEvent(SevDebug, "DatabaseUnlockFailure").error(e);
+				ASSERT(e.code() != error_code_database_locked);
+				wait(tx->onError(e));
+			}
+		}
+		// test consistencycheck which only used by ConsistencyCheck Workload
+		// Note: we have exclusive ownership of fdbShouldConsistencyCheckBeSuspended,
+		// no existing workloads can modify the key
+		{
+			try {
+				tx->setOption(FDBTransactionOptions::READ_SYSTEM_KEYS);
+				Optional<Value> val1 = wait(tx->get(fdbShouldConsistencyCheckBeSuspended));
+				state bool ccSuspendSetting =
+				    val1.present() ? BinaryReader::fromStringRef<bool>(val1.get(), Unversioned()) : false;
+				Optional<Value> val2 =
+				    wait(tx->get(SpecialKeySpace::getManagementApiCommandPrefix("consistencycheck")));
+				// Make sure the read result from special key consistency with the system key
+				ASSERT(ccSuspendSetting ? val2.present() : !val2.present());
+				tx->setOption(FDBTransactionOptions::SPECIAL_KEY_SPACE_ENABLE_WRITES);
+				// Make sure by default, consistencycheck is enabled
+				ASSERT(!ccSuspendSetting);
+				// Disable consistencycheck
+				tx->set(SpecialKeySpace::getManagementApiCommandPrefix("consistencycheck"), ValueRef());
+				wait(tx->commit());
+				tx->reset();
+				// Read system key to make sure it is disabled
+				tx->setOption(FDBTransactionOptions::READ_SYSTEM_KEYS);
+				Optional<Value> val3 = wait(tx->get(fdbShouldConsistencyCheckBeSuspended));
+				bool ccSuspendSetting2 =
+				    val3.present() ? BinaryReader::fromStringRef<bool>(val3.get(), Unversioned()) : false;
+				ASSERT(ccSuspendSetting2);
+				tx->reset();
+			} catch (Error& e) {
+				wait(tx->onError(e));
+			}
+		}
+		// make sure we enable consistencycheck by the end
+		{
+			loop {
+				try {
+					tx->setOption(FDBTransactionOptions::SPECIAL_KEY_SPACE_ENABLE_WRITES);
+					tx->clear(SpecialKeySpace::getManagementApiCommandPrefix("consistencycheck"));
+					wait(tx->commit());
+					tx->reset();
+					break;
+				} catch (Error& e) {
+					wait(tx->onError(e));
+				}
 			}
 		}
 		return Void();

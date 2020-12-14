@@ -490,6 +490,7 @@ const KeyRef JSONSchemas::statusSchema = LiteralStringRef(R"statusSchema(
 )statusSchema"
                                                           R"statusSchema(
       "recovery_state":{
+         "seconds_since_last_recovered":1,
          "required_resolvers":1,
          "required_commit_proxies":1,
          "required_grv_proxies":1,
@@ -785,7 +786,8 @@ const KeyRef JSONSchemas::statusSchema = LiteralStringRef(R"statusSchema(
          "coordinators":[
             {
                "reachable":true,
-               "address":"127.0.0.1:4701"
+               "address":"127.0.0.1:4701",
+               "protocol": "0fdb00b070010001"
             }
          ],
          "quorum_reachable":true
@@ -938,6 +940,8 @@ const KeyRef JSONSchemas::storageHealthSchema = LiteralStringRef(R"""(
 const KeyRef JSONSchemas::aggregateHealthSchema = LiteralStringRef(R"""(
 {
   "batch_limited": false,
+  "limiting_storage_durability_lag": 5050809,
+  "limiting_storage_queue": 2030,
   "tps_limit": 457082.8105811302,
   "worst_storage_durability_lag": 5050809,
   "worst_storage_queue": 2030,

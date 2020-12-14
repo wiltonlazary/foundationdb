@@ -95,6 +95,7 @@ ERROR( server_overloaded, 1211, "Server is under too much load and cannot respon
 ERROR( master_backup_worker_failed, 1212, "Master terminating because a backup worker failed")
 ERROR( tag_throttled, 1213, "Transaction tag is being throttled" )
 ERROR( grv_proxy_failed, 1214, "Master terminating because a GRV CommitProxy failed" )
+ERROR( dd_tracker_cancelled, 1215, "The data distribution tracker has been cancelled" )
 
 // 15xx Platform errors
 ERROR( platform_error, 1500, "Platform error" )
@@ -145,6 +146,7 @@ ERROR( environment_variable_network_option_failed, 2022, "Environment variable n
 ERROR( transaction_read_only, 2023, "Attempted to commit a transaction specified as read-only" )
 ERROR( invalid_cache_eviction_policy, 2024, "Invalid cache eviction policy, only random and lru are supported" )
 ERROR( network_cannot_be_restarted, 2025, "Network can only be started once" )
+ERROR( blocked_from_network_thread, 2026, "Detected a deadlock in a callback called from the network thread" )
 
 ERROR( incompatible_protocol_version, 2100, "Incompatible protocol version" )
 ERROR( transaction_too_large, 2101, "Transaction exceeds byte limit" )
@@ -204,6 +206,8 @@ ERROR( backup_cannot_expire, 2316, "Cannot expire requested data from backup wit
 ERROR( backup_auth_missing, 2317, "Cannot find authentication details (such as a password or secret key) for the specified Backup Container URL")
 ERROR( backup_auth_unreadable, 2318, "Cannot read or parse one or more sources of authentication information for Backup Container URLs")
 ERROR( backup_does_not_exist, 2319, "Backup does not exist")
+ERROR( backup_not_filterable_with_key_ranges, 2320, "Backup before 6.3 cannot be filtered with key ranges")
+ERROR( backup_not_overlapped_with_keys_filter, 2321, "Backup key ranges doesn't overlap with key ranges filter")
 ERROR( restore_invalid_version, 2361, "Invalid restore version")
 ERROR( restore_corrupted_data, 2362, "Corrupted backup data")
 ERROR( restore_missing_data, 2363, "Missing backup data")

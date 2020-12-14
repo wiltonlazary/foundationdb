@@ -25,11 +25,12 @@
 #include "fdbclient/StorageServerInterface.h"
 #include "fdbserver/Knobs.h"
 #include "flow/ActorCollection.h"
+#include "flow/ProtocolVersion.h"
 #include "flow/SystemMonitor.h"
 #include "flow/TDMetric.actor.h"
 #include "fdbrpc/simulator.h"
 #include "fdbclient/NativeAPI.actor.h"
-#include "fdbclient/MetricLogger.h"
+#include "fdbserver/MetricLogger.h"
 #include "fdbserver/BackupInterface.h"
 #include "fdbserver/WorkerInterface.actor.h"
 #include "fdbserver/IKeyValueStore.h"
@@ -46,6 +47,7 @@
 #include "flow/Profiler.h"
 #include "flow/ThreadHelper.actor.h"
 #include "flow/Trace.h"
+#include "flow/network.h"
 
 #ifdef __linux__
 #include <fcntl.h>
@@ -127,7 +129,7 @@ ACTOR static Future<Void> extractClientInfo( Reference<AsyncVar<ServerDBInfo>> d
 }
 
 Database openDBOnServer( Reference<AsyncVar<ServerDBInfo>> const& db, TaskPriority taskID, bool enableLocalityLoadBalance, bool lockAware ) {
-	Reference<AsyncVar<ClientDBInfo>> info( new AsyncVar<ClientDBInfo> );
+	auto info = makeReference<AsyncVar<ClientDBInfo>>();
 	return DatabaseContext::create( info, extractClientInfo(db, info), enableLocalityLoadBalance ? db->get().myLocality : LocalityData(), enableLocalityLoadBalance, taskID, lockAware );
 }
 
@@ -353,6 +355,7 @@ struct TLogOptions {
 				"_LS_" + boost::lexical_cast<std::string>(spillType);
 			break;
 		case TLogVersion::V5:
+		case TLogVersion::V6:
 			toReturn = "V_" + boost::lexical_cast<std::string>(version);
 			break;
 		}
@@ -374,6 +377,7 @@ TLogFn tLogFnForOptions( TLogOptions options ) {
 			else
 				return oldTLog_6_2::tLog;
 		case TLogVersion::V5:
+		case TLogVersion::V6:
 			return tLog;
 		default:
 			ASSERT(false);
@@ -706,6 +710,7 @@ ACTOR Future<Void> storageServerRollbackRebooter( Future<Void> prevStorageServer
 		DUMPTOKEN(recruited.waitMetrics);
 		DUMPTOKEN(recruited.splitMetrics);
 		DUMPTOKEN(recruited.getReadHotRanges);
+		DUMPTOKEN(recruited.getRangeSplitPoints);
 		DUMPTOKEN(recruited.getStorageMetrics);
 		DUMPTOKEN(recruited.waitFailure);
 		DUMPTOKEN(recruited.getQueuingMetrics);
@@ -884,7 +889,7 @@ ACTOR Future<Void> monitorTraceLogIssues(Reference<AsyncVar<std::set<std::string
 			}
 		}
 		std::set<std::string> _issues;
-		retriveTraceLogIssues(_issues);
+		retrieveTraceLogIssues(_issues);
 		if (pingTimeout) {
 			// Ping trace log writer thread timeout.
 			_issues.insert("trace_log_writer_thread_unresponsive");
@@ -986,10 +991,11 @@ ACTOR Future<Void> workerServer(
 
 	filesClosed.add(stopping.getFuture());
 
-	initializeSystemMonitorMachineState(SystemMonitorMachineState(folder, locality.zoneId(), locality.machineId(), g_network->getLocalAddress().ip));
+	initializeSystemMonitorMachineState(SystemMonitorMachineState(
+	    folder, locality.dcId(), locality.zoneId(), locality.machineId(), g_network->getLocalAddress().ip));
 
 	{
-		auto recruited = interf;  //ghetto! don't we all love a good #define
+		auto recruited = interf;
 		DUMPTOKEN(recruited.clientInterface.reboot);
 		DUMPTOKEN(recruited.clientInterface.profiler);
 		DUMPTOKEN(recruited.tLog);
@@ -1036,6 +1042,7 @@ ACTOR Future<Void> workerServer(
 				DUMPTOKEN(recruited.waitMetrics);
 				DUMPTOKEN(recruited.splitMetrics);
 				DUMPTOKEN(recruited.getReadHotRanges);
+				DUMPTOKEN(recruited.getRangeSplitPoints);
 				DUMPTOKEN(recruited.getStorageMetrics);
 				DUMPTOKEN(recruited.waitFailure);
 				DUMPTOKEN(recruited.getQueuingMetrics);
@@ -1136,7 +1143,7 @@ ACTOR Future<Void> workerServer(
 
 		loop choose {
 			when( UpdateServerDBInfoRequest req = waitNext( interf.updateServerDBInfo.getFuture() ) ) {
-				ServerDBInfo localInfo = BinaryReader::fromStringRef<ServerDBInfo>(req.serializedDbInfo, AssumeVersion(currentProtocolVersion));
+				ServerDBInfo localInfo = BinaryReader::fromStringRef<ServerDBInfo>(req.serializedDbInfo, AssumeVersion(g_network->protocolVersion()));
 				localInfo.myLocality = locality;
 
 				if(localInfo.infoGeneration < dbInfo->get().infoGeneration && localInfo.clusterInterface == dbInfo->get().clusterInterface) {
@@ -1347,6 +1354,7 @@ ACTOR Future<Void> workerServer(
 					DUMPTOKEN(recruited.waitMetrics);
 					DUMPTOKEN(recruited.splitMetrics);
 					DUMPTOKEN(recruited.getReadHotRanges);
+					DUMPTOKEN(recruited.getRangeSplitPoints);
 					DUMPTOKEN(recruited.getStorageMetrics);
 					DUMPTOKEN(recruited.waitFailure);
 					DUMPTOKEN(recruited.getQueuingMetrics);
@@ -1710,7 +1718,8 @@ ACTOR Future<MonitorLeaderInfo> monitorLeaderRemotelyOneGeneration( Reference<Cl
 		if (leader.present()) {
 			if(leader.get().present()) {
 				if( leader.get().get().forward ) {
-					info.intermediateConnFile = Reference<ClusterConnectionFile>(new ClusterConnectionFile(connFile->getFilename(), ClusterConnectionString(leader.get().get().serializedInfo.toString())));
+					info.intermediateConnFile = makeReference<ClusterConnectionFile>(
+					    connFile->getFilename(), ClusterConnectionString(leader.get().get().serializedInfo.toString()));
 					return info;
 				}
 				if(connFile != info.intermediateConnFile) {
@@ -1759,7 +1768,7 @@ template <class LeaderInterface>
 Future<Void> monitorLeaderRemotely(Reference<ClusterConnectionFile> const& connFile,
 						   Reference<AsyncVar<Optional<LeaderInterface>>> const& outKnownLeader) {
 	LeaderDeserializer<LeaderInterface> deserializer;
-	Reference<AsyncVar<Value>> serializedInfo( new AsyncVar<Value> );
+	auto serializedInfo = makeReference<AsyncVar<Value>>();
 	Future<Void> m = monitorLeaderRemotelyInternal( connFile, serializedInfo );
 	return m || deserializer( serializedInfo, outKnownLeader );
 }
@@ -1789,6 +1798,16 @@ ACTOR Future<Void> monitorLeaderRemotelyWithDelayedCandidacy( Reference<ClusterC
 	}
 }
 
+ACTOR Future<Void> serveProtocolInfo() {
+	state RequestStream<ProtocolInfoRequest> protocolInfo(
+	    PeerCompatibilityPolicy{ RequirePeer::AtLeast, ProtocolVersion::withStableInterfaces() });
+	protocolInfo.makeWellKnownEndpoint(WLTOKEN_PROTOCOL_INFO, TaskPriority::DefaultEndpoint);
+	loop {
+		state ProtocolInfoRequest req = waitNext(protocolInfo.getFuture());
+		req.reply.send(ProtocolInfoReply{ g_network->protocolVersion() });
+	}
+}
+
 ACTOR Future<Void> fdbd(
 	Reference<ClusterConnectionFile> connFile,
 	LocalityData localities,
@@ -1803,6 +1822,8 @@ ACTOR Future<Void> fdbd(
 {
 	state vector<Future<Void>> actors;
 	state Promise<Void> recoveredDiskFiles;
+
+	actors.push_back(serveProtocolInfo());
 
 	try {
 		ServerCoordinators coordinators( connFile );
@@ -1825,10 +1846,11 @@ ACTOR Future<Void> fdbd(
 		// Only one process can execute on a dataFolder from this point onwards
 
 		std::string fitnessFilePath = joinPath(dataFolder, "fitness");
-		Reference<AsyncVar<Optional<ClusterControllerFullInterface>>> cc(new AsyncVar<Optional<ClusterControllerFullInterface>>);
-		Reference<AsyncVar<Optional<ClusterInterface>>> ci(new AsyncVar<Optional<ClusterInterface>>);
-		Reference<AsyncVar<ClusterControllerPriorityInfo>> asyncPriorityInfo(new AsyncVar<ClusterControllerPriorityInfo>(getCCPriorityInfo(fitnessFilePath, processClass)));
-		Reference<AsyncVar<ServerDBInfo>> dbInfo( new AsyncVar<ServerDBInfo>(ServerDBInfo()) );
+		auto cc = makeReference<AsyncVar<Optional<ClusterControllerFullInterface>>>();
+		auto ci = makeReference<AsyncVar<Optional<ClusterInterface>>>();
+		auto asyncPriorityInfo =
+		    makeReference<AsyncVar<ClusterControllerPriorityInfo>>(getCCPriorityInfo(fitnessFilePath, processClass));
+		auto dbInfo = makeReference<AsyncVar<ServerDBInfo>>();
 
 		actors.push_back(reportErrors(monitorAndWriteCCPriorityInfo(fitnessFilePath, asyncPriorityInfo), "MonitorAndWriteCCPriorityInfo"));
 		if (processClass.machineClassFitness(ProcessClass::ClusterController) == ProcessClass::NeverAssign) {

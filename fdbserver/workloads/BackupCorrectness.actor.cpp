@@ -118,15 +118,11 @@ struct BackupAndRestoreCorrectnessWorkload : TestWorkload {
 		}
 	}
 
-	virtual std::string description() {
-		return "BackupAndRestoreCorrectness";
-	}
+	std::string description() const override { return "BackupAndRestoreCorrectness"; }
 
-	virtual Future<Void> setup(Database const& cx) {
-		return Void();
-	}
+	Future<Void> setup(Database const& cx) override { return Void(); }
 
-	virtual Future<Void> start(Database const& cx) {
+	Future<Void> start(Database const& cx) override {
 		if (clientId != 0)
 			return Void();
 
@@ -145,7 +141,7 @@ struct BackupAndRestoreCorrectnessWorkload : TestWorkload {
 		return _start(cx, this);
 	}
 
-	virtual Future<bool> check(Database const& cx) {
+	Future<bool> check(Database const& cx) override {
 		if (clientId != 0)
 			return true;
 		else
@@ -175,8 +171,7 @@ struct BackupAndRestoreCorrectnessWorkload : TestWorkload {
 		return true;
 	}
 
-	virtual void getMetrics(vector<PerfMetric>& m) {
-	}
+	void getMetrics(vector<PerfMetric>& m) override {}
 
 	ACTOR static Future<Void> changePaused(Database cx, FileBackupAgent* backupAgent) {
 		loop {
@@ -238,7 +233,7 @@ struct BackupAndRestoreCorrectnessWorkload : TestWorkload {
 
 		// Stop the differential backup, if enabled
 		if (stopDifferentialDelay) {
-			TEST(!stopDifferentialFuture.isReady()); //Restore starts at specified time
+			TEST(!stopDifferentialFuture.isReady()); //Restore starts at specified time - stopDifferential not ready
 			wait(stopDifferentialFuture);
 			TraceEvent("BARW_DoBackupWaitToDiscontinue", randomID).detail("Tag", printable(tag)).detail("DifferentialAfter", stopDifferentialDelay);
 
@@ -392,7 +387,7 @@ struct BackupAndRestoreCorrectnessWorkload : TestWorkload {
 			state Future<Void> cp = changePaused(cx, &backupAgent);
 		}
 
-		// Increment the backup agent requets
+		// Increment the backup agent requests
 		if (self->agentRequest) {
 			BackupAndRestoreCorrectnessWorkload::backupAgentRequests ++;
 		}
@@ -609,7 +604,7 @@ struct BackupAndRestoreCorrectnessWorkload : TestWorkload {
 						printf("%.6f %-10s Wait #%4d for %lld tasks to end\n", now(), randomID.toString().c_str(), waitCycles, (long long) taskCount);
 
 						wait(delay(5.0));
-						tr = Reference<ReadYourWritesTransaction>(new ReadYourWritesTransaction(cx));
+						tr = makeReference<ReadYourWritesTransaction>(cx);
 						int64_t _taskCount = wait( backupAgent.getTaskCount(tr) );
 						taskCount = _taskCount;
 
